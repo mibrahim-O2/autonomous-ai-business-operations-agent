@@ -24,14 +24,14 @@ def test_gateway_rejects_unknown_forbidden_and_invalid_calls(rt):
     forbidden = run(rt.gateway.execute(state, step, "sales_ops", ALLOWED, ToolCall(tool="email_create_draft")))
     invalid = run(
         rt.gateway.execute(
-            state, step, "sales_ops", ALLOWED, ToolCall(tool="crm_upsert_contact", arguments={"email": "nope"})
+            state, step, "sales_ops", ALLOWED, ToolCall(tool="crm_upsert_contact", arguments={"name": 42})
         )
     )
     assert not unknown.ok and "unknown tool" in unknown.error
     assert not forbidden.ok and "not permitted" in forbidden.error
     assert not invalid.ok and "invalid arguments" in invalid.error
     assert step.tool_calls == []  # nothing was executed
-    assert rt.db.kv_list("demo", "crm.contacts") == {}
+    assert "email" in invalid.error and len(rt.db.kv_list("demo", "crm.contacts")) == 5  # seed data untouched
 
 
 def test_gateway_replays_completed_calls_instead_of_repeating_them(rt):
@@ -97,7 +97,7 @@ def test_gate_can_deny_or_require_approval(rt):
             )
         )
     assert caught.value.verdict.approval_id == "apr_1" and caught.value.risk == RiskLevel.LOW
-    assert rt.db.kv_list("demo", "crm.contacts") == {}  # nothing written while approval is pending
+    assert rt.db.kv_get("demo", "crm.contacts", "ok@x.example") is None  # nothing written while approval is pending
 
 
 def test_scripted_model_cannot_call_tools_it_was_not_offered():

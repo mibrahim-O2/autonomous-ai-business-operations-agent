@@ -1,38 +1,31 @@
 """End-to-end behaviour of the orchestration engine on the lead intake workflow."""
 
-from conftest import lead_task, make_settings, run
+from conftest import lead_task, make_settings, run, started
 
 from bizops.cli import main as cli_main
-from bizops.core.errors import ToolError
-from bizops.core.models import PlanStep, RiskLevel, RunState, RunStatus, StepStatus, Task
+from bizops.core.models import PlanStep, RunState, RunStatus, StepStatus, Task
 from bizops.llm import LLMResponse
 from bizops.orchestrator import resolve_refs
-from bizops.runtime import build_runtime
-from bizops.tools import GateDecision, GateVerdict, ToolSpec
-from bizops.tools.local import CreateDraft, FindSlots
+from bizops.tools import GateDecision, GateVerdict
 
-
-def _override_tool(rt, name, model, handler, risk=RiskLevel.LOW):
-    """Replace a built-in tool's handler, keeping its schema, to simulate integration failures."""
-    executor = rt.gateway._executors[0]
-    executor.register(ToolSpec(name, "test override", risk, model, handler=handler))
-    rt.gateway.refresh()
+EMAIL = "noor.abbasi@quillfield.example"
+STEPS = ["recall_context", "research_policy", "qualify_lead", "draft_reply", "propose_slots"]
 
 
 def test_lead_intake_runs_to_a_verified_report(rt):
     state = run(rt.orchestrator.submit(lead_task()))
     assert state.status == RunStatus.COMPLETED and state.final_report["outcome"] == "verified"
-    assert [s.action for s in state.plan.steps] == ["recall_context", "qualify_lead", "draft_reply", "propose_slots"]
+    assert [s.action for s in state.plan.steps] == STEPS
     assert all(s.status == StepStatus.SUCCEEDED for s in state.plan.steps)
     results = state.final_report["results"]
     assert results["qualify_lead"]["tier"] == "hot" and results["qualify_lead"]["score"] == 85
     assert len(results["propose_slots"]["slots"]) == 4 and results["draft_reply"]["sent"] is False
     # Real effects in the demo environment, not just descriptions of them.
-    contact = rt.db.kv_get("demo", "crm.contacts", "amelia.hart@harborline.example")
+    contact = rt.db.kv_get("demo", "crm.contacts", EMAIL)
     assert contact["lead_tier"] == "hot" and len(contact["notes"]) == 1
     drafts = list(rt.db.kv_list("demo", "email.drafts").values())
-    assert len(drafts) == 1 and drafts[0]["status"] == "draft" and "Hello Amelia" in drafts[0]["body"]
-    assert state.usage.calls >= 6 and state.steps_executed == 4
+    assert len(drafts) == 1 and drafts[0]["status"] == "draft" and "Hello Noor" in drafts[0]["body"]
+    assert state.usage.calls >= 6 and state.steps_executed == 5
 
 
 def test_trace_records_the_whole_execution(rt):
@@ -59,7 +52,7 @@ def test_memory_from_one_run_informs_the_next(rt):
     assert first.final_report["results"]["recall_context"]["known"] is False
     second = run(rt.orchestrator.submit(lead_task(inputs={"message": "Following up on my earlier enquiry."})))
     recall = second.final_report["results"]["recall_context"]
-    assert recall["known"] is True and any("Harborline" in text for text in recall["prior_knowledge"])
+    assert recall["known"] is True and any("Quillfield" in text for text in recall["prior_knowledge"])
     assert any("already known" in reason for reason in second.final_report["results"]["qualify_lead"]["reasons"])
     assert {m["kind"] for m in rt.db.list_memory("demo")} == {"semantic", "episodic"}
 
@@ -78,15 +71,7 @@ def test_agent_skips_retrieval_when_there_is_nothing_to_search(rt):
 
 
 def test_retryable_failure_is_retried_and_succeeds(rt):
-    attempts = {"n": 0}
-
-    async def flaky(args, ctx):
-        attempts["n"] += 1
-        if attempts["n"] == 1:
-            raise ToolError("calendar service timed out", retryable=True)
-        return {"slots": [{"start": "2026-12-01T10:00", "duration_minutes": 30}]}
-
-    _override_tool(rt, "calendar_find_slots", FindSlots, flaky, RiskLevel.READ)
+    rt.mock_control.set_fault("demo", "calendar.find_slots", times=1, retryable=True, message="calendar timed out")
     state = run(rt.orchestrator.submit(lead_task()))
     slots_step = next(s for s in state.plan.steps if s.action == "propose_slots")
     assert state.status == RunStatus.COMPLETED and slots_step.attempts == 2 and state.replans == 0
@@ -94,28 +79,23 @@ def test_retryable_failure_is_retried_and_succeeds(rt):
 
 
 def test_permanent_failure_triggers_replanning(rt):
-    async def broken(args, ctx):
-        raise ToolError("mail server rejected the request")
-
-    _override_tool(rt, "email_create_draft", CreateDraft, broken)
+    rt.mock_control.set_fault(
+        "demo", "email.create_draft", times=99, retryable=False, message="mail server rejected it"
+    )
     state = run(rt.orchestrator.submit(lead_task()))
     assert state.status == RunStatus.COMPLETED and state.replans == 1 and state.plan.version == 2
     actions = [s.action for s in state.plan.steps]
-    assert actions == ["recall_context", "qualify_lead", "log_followup_task"]
-    assert state.plan.steps[1].result["tier"] == "hot"  # completed work was carried over, not redone
-    assert state.steps_executed == 4  # recall, qualify, failed draft, follow-up
-    notes = rt.db.kv_get("demo", "crm.contacts", "amelia.hart@harborline.example")["notes"]
+    assert actions == ["recall_context", "research_policy", "qualify_lead", "log_followup_task"]
+    assert state.plan.steps[2].result["tier"] == "hot"  # completed work was carried over, not redone
+    assert state.steps_executed == 5  # recall, policy, qualify, failed draft, follow-up
+    notes = rt.db.kv_get("demo", "crm.contacts", EMAIL)["notes"]
     assert any("Manual follow-up needed" in n["text"] and "mail server" in n["text"] for n in notes)
     assert state.working_memory["_failures"][0]["action"] == "draft_reply"
 
 
 def test_run_fails_cleanly_when_recovery_is_impossible(tmp_path):
-    rt = build_runtime(make_settings(tmp_path, max_replans=0))
-
-    async def broken(args, ctx):
-        raise ToolError("mail server rejected the request")
-
-    _override_tool(rt, "email_create_draft", CreateDraft, broken)
+    rt = started(make_settings(tmp_path, max_replans=0))
+    rt.mock_control.set_fault("demo", "email.create_draft", times=99, retryable=False)
     state = run(rt.orchestrator.submit(lead_task()))
     assert state.status == RunStatus.FAILED and "draft_reply" in state.error
     assert rt.db.load_run("demo", state.run_id).status == RunStatus.FAILED  # failure is persisted
@@ -123,9 +103,9 @@ def test_run_fails_cleanly_when_recovery_is_impossible(tmp_path):
 
 
 def test_step_budget_stops_a_run(tmp_path):
-    rt = build_runtime(make_settings(tmp_path, max_steps=2))
+    rt = started(make_settings(tmp_path, max_steps=2))
     state = run(rt.orchestrator.submit(lead_task()))
-    # A four-step plan cannot be planned within a two-step limit; the template fallback is rejected too.
+    # A five-step plan cannot be planned within a two-step limit; the template fallback is rejected too.
     assert state.status == RunStatus.FAILED and "limit" in state.error
     rt.close()
 
@@ -165,31 +145,31 @@ def test_approval_gate_suspends_and_resume_does_not_repeat_side_effects(rt):
     rt.gateway.gate = gate
     waiting = run(rt.orchestrator.submit(lead_task()))
     assert waiting.status == RunStatus.WAITING_APPROVAL and waiting.pending_approval_id == "apr_x"
-    qualify = waiting.plan.steps[1]
+    qualify = waiting.plan.steps[2]
     assert qualify.status == StepStatus.WAITING_APPROVAL and qualify.attempts == 1
-    contact = rt.db.kv_get("demo", "crm.contacts", "amelia.hart@harborline.example")
+    contact = rt.db.kv_get("demo", "crm.contacts", EMAIL)
     assert contact["notes"] == []  # the upsert ran; the gated note did not
 
     approved.add(gate.last)
     finished = run(rt.orchestrator.resume("demo", waiting.run_id))
     assert finished.status == RunStatus.COMPLETED and finished.final_report["outcome"] == "verified"
-    qualify = finished.plan.steps[1]
+    qualify = finished.plan.steps[2]
     replayed = [t.tool for t in qualify.tool_calls]
     assert replayed.count("crm_upsert_contact") == 1  # executed once, replayed on the second pass
-    assert len(rt.db.kv_get("demo", "crm.contacts", "amelia.hart@harborline.example")["notes"]) == 1
+    assert len(rt.db.kv_get("demo", "crm.contacts", EMAIL)["notes"]) == 1
 
 
 def test_run_survives_a_process_restart(tmp_path):
     """State lives in the database: a second runtime can finish what the first one started."""
     settings = make_settings(tmp_path)
-    first = build_runtime(settings)
+    first = started(settings)
     state = RunState(tenant_id="demo", task=lead_task())
     first.db.save_run(state)
     first.orchestrator.request_pause("demo", state.run_id)
     run(first.orchestrator._drive(state))
     first.close()
 
-    second = build_runtime(settings)
+    second = started(settings)
     finished = run(second.orchestrator.resume("demo", state.run_id))
     assert finished.status == RunStatus.COMPLETED
     second.close()
@@ -207,6 +187,7 @@ def test_tenants_do_not_see_each_others_data(rt):
     other = run(rt.orchestrator.submit(lead_task(tenant_id="globex")))
     assert other.final_report["results"]["recall_context"]["known"] is False
     assert len(rt.db.kv_list("acme", "crm.contacts")) == 1 and len(rt.db.kv_list("globex", "crm.contacts")) == 1
+    assert other.final_report["results"]["research_policy"]["grounded"] is False  # no documents for this tenant
     assert rt.db.list_runs("nobody") == []
 
 
@@ -233,7 +214,7 @@ def test_planner_repairs_then_falls_back_when_the_model_returns_an_invalid_plan(
     state = run(rt.orchestrator.submit(lead_task()))
     kinds = [e["kind"] for e in rt.tracer.timeline("demo", state.run_id)]
     assert kinds.count("plan.invalid") == 2 and "plan.fallback" in kinds
-    assert state.status == RunStatus.COMPLETED and len(state.plan.steps) == 4
+    assert state.status == RunStatus.COMPLETED and len(state.plan.steps) == 5
 
 
 def test_handoff_moves_a_step_to_a_capable_agent(rt):
@@ -265,7 +246,7 @@ def test_handoff_moves_a_step_to_a_capable_agent(rt):
         {**s, "agent": "intake"} if s["action"] == "qualify_lead" else s for s in original_plan(task, analysis)
     ]
     state = run(rt.orchestrator.submit(lead_task()))
-    assert state.status == RunStatus.COMPLETED and state.plan.steps[1].agent == "sales_ops"
+    assert state.status == RunStatus.COMPLETED and state.plan.steps[2].agent == "sales_ops"
     assert "step.handoff" in [e["kind"] for e in rt.tracer.timeline("demo", state.run_id)]
 
 
@@ -279,7 +260,7 @@ def test_reference_resolution():
         "d": "$5 fee",
     }
     resolved = resolve_refs(value, state)
-    assert resolved == {"a": "amelia.hart@harborline.example", "b": [85], "c": None, "d": "$5 fee"}
+    assert resolved == {"a": EMAIL, "b": [85], "c": None, "d": "$5 fee"}
     assert PlanStep(agent="a", action="b", description="c").status == StepStatus.PENDING
 
 
@@ -296,6 +277,8 @@ def test_cli_demo_and_inspection_commands(tmp_path, monkeypatch, capsys):
     assert cli_main(["status", run_id]) == 0 and cli_main(["trace", run_id]) == 0
     assert cli_main(["runs"]) == 0 and cli_main(["tools"]) == 0 and cli_main(["agents"]) == 0
     assert "crm_upsert_contact" in capsys.readouterr().out
+    assert cli_main(["demo", "collections"]) == 0 and cli_main(["kb", "search", "refund approval"]) == 0
+    assert "Refund Policy" in capsys.readouterr().out
     assert cli_main(["status", "run_missing"]) == 1
     get_settings.cache_clear()
 
@@ -303,9 +286,9 @@ def test_cli_demo_and_inspection_commands(tmp_path, monkeypatch, capsys):
 def test_unusable_input_fails_cleanly_without_side_effects(rt):
     """A lead with no email cannot be stored; the run must fail with a reason, not crash or write junk."""
     state = run(rt.orchestrator.submit(lead_task(inputs={"email": ""})))
-    assert state.status == RunStatus.FAILED and "invalid arguments" in state.error
+    assert state.status == RunStatus.FAILED and "not a valid email" in state.error
     assert state.replans == 1  # recovery was attempted and also could not proceed
-    assert rt.db.kv_list("demo", "crm.contacts") == {} and rt.db.kv_list("demo", "email.drafts") == {}
+    assert len(rt.db.kv_list("demo", "crm.contacts")) == 5 and rt.db.kv_list("demo", "email.drafts") == {}
 
 
 def test_model_outage_is_retried_then_recovered(rt):

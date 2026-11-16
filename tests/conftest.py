@@ -11,9 +11,9 @@ from bizops.core.models import Task
 from bizops.runtime import Runtime, build_runtime
 
 LEAD = {
-    "name": "Amelia Hart",
-    "email": "amelia.hart@harborline.example",
-    "company": "Harborline Realty",
+    "name": "Noor Abbasi",
+    "email": "noor.abbasi@quillfield.example",
+    "company": "Quillfield Partners",
     "message": "We have budget approved and would like a demo this week.",
 }
 
@@ -25,6 +25,7 @@ def make_settings(tmp_path, **overrides) -> Settings:
 @pytest.fixture
 def rt(tmp_path) -> Runtime:
     runtime = build_runtime(make_settings(tmp_path))
+    asyncio.run(runtime.start())  # discover MCP tools and seed the demo tenant
     yield runtime
     runtime.close()
 
@@ -36,3 +37,9 @@ def lead_task(**overrides) -> Task:
 
 def run(coro):
     return asyncio.run(coro)
+
+
+def started(settings) -> Runtime:
+    runtime = build_runtime(settings)
+    asyncio.run(runtime.start())
+    return runtime
