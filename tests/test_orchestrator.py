@@ -324,3 +324,17 @@ def test_model_outage_is_retried_then_recovered(rt):
     state = run(rt.orchestrator.submit(lead_task()))
     draft = next(s for s in state.plan.steps if s.action == "draft_reply")
     assert state.status == RunStatus.COMPLETED and draft.attempts == 2 and state.replans == 0
+
+
+def test_idempotency_race_is_resolved_by_the_unique_index(rt, monkeypatch):
+    """If two submissions pass the lookup at once, the database constraint decides and no second run starts."""
+    first = run(rt.orchestrator.submit(lead_task(idempotency_key="race-1")))
+    real_find, calls = rt.db.find_run_by_idempotency_key, {"n": 0}
+
+    def find_after_miss(tenant_id, key):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else real_find(tenant_id, key)  # first lookup misses, as in a race
+
+    monkeypatch.setattr(rt.db, "find_run_by_idempotency_key", find_after_miss)
+    second = run(rt.orchestrator.submit(lead_task(idempotency_key="race-1")))
+    assert second.run_id == first.run_id and len(rt.db.list_runs("demo")) == 1

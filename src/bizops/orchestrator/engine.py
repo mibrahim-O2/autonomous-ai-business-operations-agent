@@ -14,6 +14,7 @@ so a signal cannot leave a tool half-applied.
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime
 from typing import Any
 
@@ -95,7 +96,15 @@ class Orchestrator:
                 )
                 return existing
         state = RunState(tenant_id=task.tenant_id, task=task)
-        self.db.save_run(state)
+        try:
+            self.db.save_run(state)
+        except sqlite3.IntegrityError:
+            # Another submission with the same idempotency key won the race between the lookup
+            # above and this insert. The unique index is the real guarantee; return the winner.
+            winner = self.db.find_run_by_idempotency_key(task.tenant_id, task.idempotency_key or "")
+            if winner is None:
+                raise
+            return winner
         self.tracer.event(
             state.tenant_id,
             state.run_id,
