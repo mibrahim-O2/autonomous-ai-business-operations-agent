@@ -20,7 +20,7 @@ from typing import Any
 
 from ..agents import AgentContext, AgentRegistry, PlannerAgent, build_report, verify_run
 from ..core.config import Settings
-from ..core.errors import BizOpsError, BudgetExceeded
+from ..core.errors import BizOpsError, BudgetExceeded, PlanningError
 from ..core.models import (
     TERMINAL_RUN_STATES,
     AgentResult,
@@ -86,15 +86,19 @@ class Orchestrator:
         self.registry, self.workflows, self.planner, self.ctx = registry, workflows, planner, agent_ctx
 
     # Public API --------------------------------------------------------------
-    async def submit(self, task: Task) -> RunState:
-        """Start a run and drive it until it completes or suspends."""
+    def create(self, task: Task) -> tuple[RunState, bool]:
+        """Register a run without executing it. Returns (state, created).
+
+        Separating creation from execution lets an API respond with a run id at
+        once and drive the run in the background.
+        """
         if task.idempotency_key:
             existing = self.db.find_run_by_idempotency_key(task.tenant_id, task.idempotency_key)
             if existing is not None:
                 self.tracer.event(
                     task.tenant_id, existing.run_id, "run.duplicate_ignored", idempotency_key=task.idempotency_key
                 )
-                return existing
+                return existing, False
         state = RunState(tenant_id=task.tenant_id, task=task)
         try:
             self.db.save_run(state)
@@ -104,7 +108,7 @@ class Orchestrator:
             winner = self.db.find_run_by_idempotency_key(task.tenant_id, task.idempotency_key or "")
             if winner is None:
                 raise
-            return winner
+            return winner, False
         self.tracer.event(
             state.tenant_id,
             state.run_id,
@@ -113,6 +117,15 @@ class Orchestrator:
             source=task.source,
             requested_by=task.requested_by,
         )
+        return state, True
+
+    async def submit(self, task: Task) -> RunState:
+        """Start a run and drive it until it completes or suspends."""
+        state, created = self.create(task)
+        return await self.drive(state) if created else state
+
+    async def drive(self, state: RunState) -> RunState:
+        """Execute a created run until it completes or suspends."""
         return await self._drive(state)
 
     async def resume(self, tenant_id: str, run_id: str) -> RunState:
@@ -185,6 +198,12 @@ class Orchestrator:
                 rationale=state.plan.rationale,
                 steps=[f"{s.agent}.{s.action}" for s in state.plan.steps],
             )
+
+        disabled = sorted(
+            {s.agent for s in state.plan.steps if not self.registry.is_enabled(self.db, state.tenant_id, s.agent)}
+        )
+        if disabled and any(s.status == StepStatus.PENDING and s.agent in disabled for s in state.plan.steps):
+            raise PlanningError(f"the plan needs agent(s) that an operator has disabled: {disabled}")
 
         while True:
             signal = self.db.get_control(state.tenant_id, state.run_id)

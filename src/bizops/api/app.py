@@ -20,13 +20,19 @@ import contextlib
 import hashlib
 import hmac
 import json
+from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi.staticfiles import StaticFiles
 
 from ..core.errors import RunNotFound
 from ..core.models import Task
 from ..runtime import Runtime
+from .dashboard import build_dashboard_router
+
+DASHBOARD_DIR = Path(__file__).resolve().parents[3] / "dashboard"
+LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 # Which workflow each webhook event starts, and how its payload maps to task inputs.
 EVENT_ROUTES: dict[str, dict[str, Any]] = {
@@ -67,6 +73,32 @@ def create_app(rt: Runtime, *, run_worker: bool = True) -> FastAPI:
                     await worker_task
 
     app = FastAPI(title="Autonomous AI Business Operations Agent", version="0.2.0", lifespan=lifespan)
+    background: set[asyncio.Task] = set()
+
+    def dashboard_access(request: Request, authorization: str | None = Header(default=None)) -> None:
+        """Who may use the dashboard API.
+
+        With BIZOPS_API_KEY set, a bearer key is required. Without it, only requests
+        from this machine (loopback) are served: convenient for local use, closed to
+        the network. A deployment reachable by others must set a key.
+        """
+        configured = rt.settings.api_key.get_secret_value() if rt.settings.api_key else ""
+        if configured:
+            supplied = (authorization or "").removeprefix("Bearer ").strip()
+            if not hmac.compare_digest(configured.encode(), supplied.encode()):
+                raise HTTPException(401, "invalid or missing API key")
+            return
+        host = request.client.host if request.client else ""
+        if host not in LOOPBACK_HOSTS:
+            raise HTTPException(403, "dashboard access from other machines requires BIZOPS_API_KEY")
+
+    app.include_router(build_dashboard_router(rt, dashboard_access, background))
+
+    @app.get("/config.js", include_in_schema=False)
+    async def dashboard_config() -> Response:
+        """Tells the static dashboard that a live backend is present (the Pages build ships a demo config)."""
+        body = "window.BIZOPS_CONFIG = " + json.dumps({"mode": "live", "apiBase": "/api"}) + ";\n"
+        return Response(body, media_type="application/javascript", headers={"Cache-Control": "no-store"})
 
     def require_api_key(authorization: str | None = Header(default=None)) -> None:
         configured = rt.settings.api_key.get_secret_value() if rt.settings.api_key else ""
@@ -149,4 +181,7 @@ def create_app(rt: Runtime, *, run_worker: bool = True) -> FastAPI:
     async def get_trace(run_id: str, tenant_id: str | None = None) -> list[dict[str, Any]]:
         return rt.tracer.timeline(tenant_id or rt.settings.default_tenant, run_id)
 
+    if DASHBOARD_DIR.exists():
+        # Mounted last so that API routes take precedence over static files.
+        app.mount("/", StaticFiles(directory=DASHBOARD_DIR, html=True), name="dashboard")
     return app

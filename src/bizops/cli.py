@@ -21,19 +21,10 @@ from typing import Any
 
 from .core.errors import BizOpsError
 from .core.models import RunState, Task
+from .demo import SCENARIOS
 from .runtime import Runtime, build_runtime
 
-DEMO_LEAD = {
-    "name": "Noor Abbasi",
-    "email": "noor.abbasi@quillfield.example",
-    "company": "Quillfield Partners",
-    "message": "We need help handling inbound enquiries. We have budget approved and would like a demo this week.",
-}
-DEMOS = {
-    "lead": ("Handle a new inbound lead", "lead_intake", DEMO_LEAD),
-    "collections": ("Review overdue invoices and send payment reminders", "invoice_collections", {}),
-    "inbox": ("Triage the unread inbox", "inbox_triage", {}),
-}
+DEMOS = {s["key"]: (s["objective"], name, s["inputs"]) for name, s in SCENARIOS.items()}
 STATE_NAMESPACES = {
     "crm": "crm.contacts",
     "sent": "email.sent",

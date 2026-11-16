@@ -124,10 +124,30 @@ class KnowledgeBase:
 
     def list_documents(self, tenant_id: str) -> list[dict[str, Any]]:
         rows = self.db.query(
-            "SELECT doc_id, title, doc_type, source, trusted FROM documents WHERE tenant_id=? ORDER BY title",
+            "SELECT d.doc_id, d.title, d.doc_type, d.source, d.trusted, d.metadata_json, d.created_at, "
+            "COUNT(c.chunk_id) AS chunks FROM documents d LEFT JOIN chunks c ON c.doc_id = d.doc_id "
+            "WHERE d.tenant_id=? GROUP BY d.doc_id ORDER BY d.title",
             (tenant_id,),
         )
-        return [dict(row) | {"trusted": bool(row["trusted"])} for row in rows]
+        return [
+            {
+                "doc_id": row["doc_id"],
+                "title": row["title"],
+                "doc_type": row["doc_type"],
+                "source": row["source"],
+                "trusted": bool(row["trusted"]),
+                "chunks": row["chunks"],
+                "tags": json.loads(row["metadata_json"]).get("tags", []),
+                "embedder": json.loads(row["metadata_json"]).get("embedder", ""),
+                "created_at": row["created_at"],
+                "status": "indexed" if row["chunks"] else "empty",
+            }
+            for row in rows
+        ]
+
+    def delete_document(self, tenant_id: str, doc_id: str) -> bool:
+        """Remove a document and, by cascade, its chunks."""
+        return self.db.execute("DELETE FROM documents WHERE tenant_id=? AND doc_id=?", (tenant_id, doc_id)).rowcount > 0
 
     # Retrieval ---------------------------------------------------------------
     def search(

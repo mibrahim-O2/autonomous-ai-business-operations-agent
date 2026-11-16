@@ -8,6 +8,7 @@ orchestrator and the agent loop do not change.
 
 from __future__ import annotations
 
+from ..storage import Database
 from .base import AgentSpec, SpecialistAgent
 
 
@@ -88,6 +89,21 @@ class AgentRegistry:
     def supports(self, agent: str, action: str) -> bool:
         found = self._agents.get(agent)
         return found is not None and action in found.spec.actions
+
+    # Operators can switch a specialist off per tenant. The flag lives in the database so it
+    # survives restarts and is shared by every process.
+    @staticmethod
+    def is_enabled(db: Database, tenant_id: str, agent: str) -> bool:
+        state = db.kv_get(tenant_id, "agents.state", agent)
+        return True if state is None else bool(state.get("enabled", True))
+
+    def set_enabled(self, db: Database, tenant_id: str, agent: str, enabled: bool) -> None:
+        if agent not in self._agents:
+            raise KeyError(agent)
+        db.kv_put(tenant_id, "agents.state", agent, {"enabled": enabled})
+
+    def specs(self) -> list[AgentSpec]:
+        return [agent.spec for agent in self._agents.values()]
 
     def describe(self) -> list[dict[str, object]]:
         """Capability list given to the planner so it can delegate."""

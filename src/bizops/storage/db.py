@@ -250,7 +250,33 @@ class Database:
         rows = self.query("SELECT * FROM events WHERE tenant_id=? AND run_id=? ORDER BY event_id", (tenant_id, run_id))
         return [dict(row) | {"payload": json.loads(row["payload_json"])} for row in rows]
 
+    def list_events_by_kind(self, tenant_id: str, kind: str, limit: int = 100) -> list[dict[str, Any]]:
+        """Most recent events of one kind across all of a tenant's runs (newest first)."""
+        rows = self.query(
+            "SELECT * FROM events WHERE tenant_id=? AND kind=? ORDER BY event_id DESC LIMIT ?", (tenant_id, kind, limit)
+        )
+        return [dict(row) | {"payload": json.loads(row["payload_json"])} for row in rows]
+
+    def recent_events(self, tenant_id: str, kinds: list[str], limit: int = 30) -> list[dict[str, Any]]:
+        marks = ",".join("?" for _ in kinds)
+        rows = self.query(
+            f"SELECT * FROM events WHERE tenant_id=? AND kind IN ({marks}) ORDER BY event_id DESC LIMIT ?",
+            (tenant_id, *kinds, limit),
+        )
+        return [dict(row) | {"payload": json.loads(row["payload_json"])} for row in rows]
+
+    def load_runs(self, tenant_id: str, limit: int = 200) -> list[RunState]:
+        rows = self.query(
+            "SELECT state_json FROM runs WHERE tenant_id=? ORDER BY created_at DESC LIMIT ?", (tenant_id, limit)
+        )
+        return [RunState.model_validate_json(row["state_json"]) for row in rows]
+
     # Memory ------------------------------------------------------------------
+    def delete_memory(self, tenant_id: str, item_id: str) -> bool:
+        return (
+            self.execute("DELETE FROM memory_items WHERE tenant_id=? AND item_id=?", (tenant_id, item_id)).rowcount > 0
+        )
+
     def add_memory(self, item_id: str, tenant_id: str, kind: str, text: str, metadata: dict[str, Any]) -> None:
         self.execute(
             "INSERT OR REPLACE INTO memory_items(item_id, tenant_id, kind, text, metadata_json, created_at) "
