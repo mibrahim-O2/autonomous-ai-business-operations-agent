@@ -48,7 +48,7 @@ This document describes the system as implemented. Sections marked "planned" des
                                                      |
                                         +------------v-----------+
                                         | Tool executors         |
-                                        | (local now, MCP next)  |
+                                        | (local and MCP server) |
                                         +------------+-----------+
                                                      |
      +-----------+   +-----------+   +---------------v--------+
@@ -65,7 +65,11 @@ This document describes the system as implemented. Sections marked "planned" des
 | `bizops.agents` | Planner, specialist loop, agent registry, verification, report |
 | `bizops.workflows` | Playbooks: detection keywords, plan template, recovery plan, expected outputs, scripted behaviour |
 | `bizops.llm` | Provider protocol, scripted provider, Anthropic and OpenAI-compatible adapters, usage pricing |
-| `bizops.tools` | Tool specification, gateway, approval-gate interface, built-in demo tools |
+| `bizops.tools` | Tool specification, gateway, approval-gate interface, local tools, MCP client executor |
+| `bizops.mcp_server` | Business operations MCP server: tools, resources, prompts |
+| `bizops.integrations` | Adapter interfaces, stateful mocks, HTTP integration framework |
+| `bizops.knowledge` | Ingestion, chunking, embeddings, hybrid retrieval |
+| `bizops.jobs`, `bizops.api` | Durable job queue and worker; webhook and inspection API |
 | `bizops.memory` | Long-term memory store with BM25 retrieval, context builder with a token budget |
 | `bizops.storage` | SQLite repository and migrations |
 | `bizops.observability` | Structured logging, span tracing |
@@ -118,10 +122,41 @@ Every model call, tool call, step, and run is a span with a duration and a paren
 
 See `SECURITY.md`. In summary: least-privilege tool allow-lists, schema validation, enforcement below the model, tenant-scoped storage, secrets from the environment only, and taint tracking for untrusted content.
 
-## 11. Planned work
+## 11. MCP layer
+
+The business systems are reached only through the `bizops-business` MCP server (`mcp_server/server.py`), which wraps the adapter interfaces. It exposes 16 tools, three resource templates (contacts, overdue invoices, inbox headers), and two prompts. Each tool carries metadata: a risk level and a flag for outside-authored content.
+
+`MCPToolExecutor` is the client side. On discovery it converts each MCP tool to a `ToolSpec`, hiding `tenant_id` and `idempotency_key` from the schema the model sees and injecting them at call time. Unknown risk is treated as high. Tool results use an envelope (`ok`, `data`, `error`, `retryable`) so that transient and permanent failures are distinguished across the protocol boundary.
+
+The server is used in-process by default and can run as a separate stdio process (`bizops-mcp`). A client session is opened per operation; a long-lived session would be the optimisation for a remote server under load.
+
+## 12. Integrations
+
+`integrations/base.py` defines four adapter protocols. `integrations/mock.py` implements them with real state in the key-value store and a `MockControl` for fault injection and a fixed reference date. `integrations/http.py` provides `HttpIntegration` (timeouts, retries with exponential backoff and jitter, circuit breaker, idempotency header, error mapping) and `RestCRMAdapter` as a worked example.
+
+Idempotency is applied at three levels: task intake (idempotency key on the run), step re-execution (gateway replay), and the target system (idempotency key passed through MCP to the adapter). An operation that touches two systems, such as sending a reminder and recording it, remembers its first half under a sub-key so that a retry does not repeat it.
+
+## 13. Knowledge and agentic retrieval
+
+Ingestion parses optional front matter, splits Markdown at headings, windows long sections by sentence with overlap, embeds each chunk, and stores it. Re-ingesting unchanged content is a no-op; changed content replaces the document's chunks in one transaction.
+
+Search filters by tenant, document type, tags, and trust, ranks by BM25 and by vector similarity, fuses the rankings with reciprocal rank fusion, and reranks by query-term coverage, phrase match, and heading match. Results carry a citation (`title > section`) and their component scores. Tokens are lightly stemmed so that word forms such as "approve" and "approval" match.
+
+Embeddings are produced by a feature-hashing embedder: no model download, deterministic, lexical not semantic. This is the weakest component and is isolated behind the `Embedder` protocol. It cannot reliably separate two passages that use the same words for different subjects. Search scans all of a tenant's chunks, which is adequate for hundreds of documents; a vector index (for example pgvector) is the scaling path.
+
+The research agent's retrieval is agentic in four respects: it decides whether to search at all, chooses source and filters, judges result quality and reformulates once, and reports failure instead of guessing. A workflow can mark retrieval optional when it has a safe default. Retrieval steers execution in two ways: extracted values parameterise later steps, and a failure to ground triggers replanning.
+
+Documents have a `trusted` flag. A search result that includes untrusted material marks the tool result as untrusted and taints the run.
+
+## 14. Intake, queue, and worker
+
+`POST /webhooks/{source}` verifies an HMAC-SHA256 signature over the raw body, requires an event id, maps the event to a workflow, and enqueues a job. The queue is a table; claiming is a conditional update inside a transaction, so two workers cannot take one job. Failed jobs are retried with a growing delay and marked dead after three attempts. A job left running by a dead worker is returned to the queue after ten minutes.
+
+Known gap: the API key and webhook secret are single shared values and do not bind a caller to a tenant. Tenant-bound credentials and roles are part of the access-control work in pull request 3.
+
+## 15. Planned work
 
 | Pull request | Adds |
 |---|---|
-| 2 | MCP server and client gateway, stateful mock integrations, API integration framework, webhooks, document ingestion and hybrid retrieval, agentic retrieval |
 | 3 | Approval policy engine, approvals with history, access control, audit trail, timeouts, backoff, recovery of interrupted runs, run lease, injection defences |
-| 4 | Evaluation framework, dashboard, cost reporting, Docker, deployment and integration guides |
+| 4 | Evaluation framework, dashboard, cost reporting, Docker, deployment guide |
