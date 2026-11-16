@@ -95,19 +95,21 @@ class LocalToolExecutor:
         return {"results": results, "_untrusted": any(not h.trusted for h in hits)}
 
     async def _create_task(self, args: CreateTask, ctx: ToolContext) -> dict[str, Any]:
-        # The idempotency key makes a replayed call return the same task instead of a second one.
+        def create() -> dict[str, Any]:
+            task = {
+                "task_id": new_id("optask"),
+                "title": args.title,
+                "detail": args.detail,
+                "assignee": args.assignee,
+                "status": "open",
+                "run_id": ctx.run_id,
+            }
+            ctx.db.kv_put(ctx.tenant_id, "ops.tasks", task["task_id"], task)
+            return task
+
+        # Same exactly-once and fencing rules as tools served over MCP.
         key = ctx.idempotency_key or new_id("k")
-        existing = ctx.db.idempotency_get(ctx.tenant_id, key)
-        if existing is not None:
-            return existing
-        task = {
-            "task_id": new_id("optask"),
-            "title": args.title,
-            "detail": args.detail,
-            "assignee": args.assignee,
-            "status": "open",
-            "run_id": ctx.run_id,
-        }
-        ctx.db.kv_put(ctx.tenant_id, "ops.tasks", task["task_id"], task)
-        ctx.db.idempotency_put(ctx.tenant_id, key, "ops.create_task", task)
+        task, _ = ctx.db.run_once(
+            ctx.tenant_id, key, "ops.create_task", create, fence_scope=ctx.run_id, fence_token=ctx.fencing_token
+        )
         return task

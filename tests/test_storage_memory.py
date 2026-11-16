@@ -12,8 +12,9 @@ def test_run_checkpoint_roundtrip_and_tenant_isolation(tmp_path):
     db = Database(tmp_path / "a.db")
     state = RunState(tenant_id="acme", task=lead_task(tenant_id="acme"))
     db.save_run(state)
+    state.generation = db.claim_run("acme", state.run_id, "worker_a", 60)
     state.status = RunStatus.PAUSED
-    db.save_run(state)
+    db.save_run(state, fence=("worker_a", state.generation))
     loaded = db.load_run("acme", state.run_id)
     assert loaded.status == RunStatus.PAUSED and loaded.task.inputs["company"] == "Quillfield Partners"
     assert db.list_runs("other") == []

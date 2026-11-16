@@ -298,7 +298,7 @@ def build_dashboard_router(rt: Runtime, access: Any, background: set[asyncio.Tas
             requested_by="dashboard",
         )
         state, _ = rt.orchestrator.create(task)
-        job = asyncio.create_task(rt.orchestrator.drive(state))
+        job = asyncio.create_task(rt.orchestrator.drive(state.tenant_id, state.run_id))
         background.add(job)  # keep a reference so the task is not garbage-collected mid-run
         job.add_done_callback(background.discard)
         return {"run_id": state.run_id, "status": state.status.value}

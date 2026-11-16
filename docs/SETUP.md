@@ -39,6 +39,7 @@ The defaults run the offline scripted model and store state in `var/bizops.db`. 
 | `BIZOPS_LLM_MODEL` | empty | Model name for a hosted provider |
 | `BIZOPS_MAX_STEPS` | `20` | Maximum steps per run |
 | `BIZOPS_MAX_REPLANS` | `2` | Maximum recovery plans per run |
+| `BIZOPS_RUN_LEASE_SECONDS` | `60` | Time a worker may hold a run without renewing before another worker may take it over |
 | `BIZOPS_MAX_RUN_COST_USD` | `1.00` | Estimated cost ceiling per run |
 | `BIZOPS_CONTEXT_TOKEN_BUDGET` | `6000` | Token budget for an agent's context |
 | `BIZOPS_SEED_DEMO_DATA` | `true` | Load fictional records and policy documents at start-up |

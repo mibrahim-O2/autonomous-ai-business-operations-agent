@@ -30,6 +30,9 @@ class ToolContext:
     # Stable per (run, step, call). Tools with side effects pass it on so that a
     # repeated call is recognised by the target system and not performed twice.
     idempotency_key: str = ""
+    # The run's claim generation. Target systems refuse a token lower than one they have
+    # already seen for the run, which stops a superseded worker from acting.
+    fencing_token: int = 0
 
 
 @dataclass

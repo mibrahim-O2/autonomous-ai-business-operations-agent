@@ -81,18 +81,32 @@ class JobQueue:
             ).rowcount
         return dict(row) | {"attempts": row["attempts"] + 1} if claimed else None
 
-    def finish(self, job_id: str, status: str, result: dict[str, Any], retry_in: timedelta | None = None) -> None:
+    def finish(
+        self,
+        job_id: str,
+        status: str,
+        result: dict[str, Any],
+        retry_in: timedelta | None = None,
+        attempt: int | None = None,
+    ) -> bool:
+        """Record a job's outcome. With `attempt`, only the worker holding that attempt may write.
+
+        The attempt number is the job's fencing token: if the job was reclaimed and
+        handed to another worker, the first worker's late result is discarded.
+        """
         now = datetime.now(UTC)
+        guard, extra = ("", ()) if attempt is None else (" AND attempts=? AND status='running'", (attempt,))
         if retry_in is not None:
-            self.db.execute(
-                "UPDATE jobs SET status='pending', run_at=?, result_json=?, updated_at=? WHERE job_id=?",
-                (_iso(now + retry_in), json.dumps(result, default=str), _iso(now), job_id),
+            cursor = self.db.execute(
+                f"UPDATE jobs SET status='pending', run_at=?, result_json=?, updated_at=? WHERE job_id=?{guard}",
+                (_iso(now + retry_in), json.dumps(result, default=str), _iso(now), job_id, *extra),
             )
         else:
-            self.db.execute(
-                "UPDATE jobs SET status=?, result_json=?, updated_at=? WHERE job_id=?",
-                (status, json.dumps(result, default=str), _iso(now), job_id),
+            cursor = self.db.execute(
+                f"UPDATE jobs SET status=?, result_json=?, updated_at=? WHERE job_id=?{guard}",
+                (status, json.dumps(result, default=str), _iso(now), job_id, *extra),
             )
+        return cursor.rowcount > 0
 
     def get(self, job_id: str) -> dict[str, Any] | None:
         rows = self.db.query("SELECT * FROM jobs WHERE job_id=?", (job_id,))
@@ -121,14 +135,20 @@ class Worker:
             task = Task.model_validate_json(job["payload_json"])
             state = await self.orchestrator.submit(task)
             result = {"run_id": state.run_id, "run_status": state.status.value}
-            self.queue.finish(job["job_id"], "done", result)
+            self.queue.finish(job["job_id"], "done", result, attempt=job["attempts"])
         except Exception as exc:  # an unexpected fault in one job must not stop the worker
             log.exception("job %s failed", job["job_id"])
             result = {"error": f"{type(exc).__name__}: {exc}"}
             if job["attempts"] < MAX_ATTEMPTS:
-                self.queue.finish(job["job_id"], "pending", result, retry_in=timedelta(seconds=2 ** job["attempts"]))
+                self.queue.finish(
+                    job["job_id"],
+                    "pending",
+                    result,
+                    retry_in=timedelta(seconds=2 ** job["attempts"]),
+                    attempt=job["attempts"],
+                )
             else:
-                self.queue.finish(job["job_id"], "dead", result)
+                self.queue.finish(job["job_id"], "dead", result, attempt=job["attempts"])
         return {"job_id": job["job_id"], **result}
 
     async def drain(self, limit: int = 100) -> list[dict[str, Any]]:

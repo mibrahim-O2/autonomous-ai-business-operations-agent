@@ -110,6 +110,9 @@ class PlanStep(BaseModel):
     result: dict[str, Any] | None = None
     error: str | None = None
     tool_calls: list[ToolResult] = Field(default_factory=list)
+    # Write-ahead intent: the side-effecting call this step is about to make, saved before it is
+    # sent and cleared once its result is recorded. Present after a crash means "outcome unknown".
+    in_flight: ToolCall | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
 
@@ -170,6 +173,9 @@ class RunState(BaseModel):
     # Set once any untrusted content has entered the run; later tasks tighten policy on it.
     tainted: bool = False
     pending_approval_id: str | None = None
+    # Fencing token: the claim generation under which this copy of the state is being executed.
+    # It increases every time a worker claims the run and is checked on every write.
+    generation: int = 0
     final_report: dict[str, Any] | None = None
     error: str | None = None
     created_at: datetime = Field(default_factory=utcnow)

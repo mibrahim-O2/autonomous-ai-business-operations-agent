@@ -114,7 +114,7 @@ def test_pause_resume_and_cancel(rt):
     state = RunState(tenant_id="demo", task=lead_task())
     rt.db.save_run(state)
     rt.orchestrator.request_pause("demo", state.run_id)
-    paused = run(rt.orchestrator._drive(state))
+    paused = run(rt.orchestrator.drive("demo", state.run_id))
     assert paused.status == RunStatus.PAUSED and paused.plan is not None and paused.steps_executed == 0
     resumed = run(rt.orchestrator.resume("demo", state.run_id))
     assert resumed.status == RunStatus.COMPLETED and resumed.final_report["outcome"] == "verified"
@@ -123,7 +123,7 @@ def test_pause_resume_and_cancel(rt):
     other = RunState(tenant_id="demo", task=lead_task())
     rt.db.save_run(other)
     rt.orchestrator.request_pause("demo", other.run_id)
-    run(rt.orchestrator._drive(other))
+    run(rt.orchestrator.drive("demo", other.run_id))
     assert rt.orchestrator.cancel("demo", other.run_id).status == RunStatus.CANCELLED
     assert run(rt.orchestrator.resume("demo", other.run_id)).status == RunStatus.CANCELLED
 
@@ -166,7 +166,7 @@ def test_run_survives_a_process_restart(tmp_path):
     state = RunState(tenant_id="demo", task=lead_task())
     first.db.save_run(state)
     first.orchestrator.request_pause("demo", state.run_id)
-    run(first.orchestrator._drive(state))
+    run(first.orchestrator.drive("demo", state.run_id))
     first.close()
 
     second = started(settings)

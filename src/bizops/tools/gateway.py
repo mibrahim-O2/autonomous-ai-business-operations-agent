@@ -7,7 +7,8 @@ Order of checks for each call:
   4. replay: an identical call already completed in this step is returned from
      the record instead of being executed again (safe re-execution after pause)
   5. the approval gate decides allow / require approval / deny
-  6. execution, timed and traced, with failures converted to structured results
+  6. fence check: the worker must still own the run
+  7. execution, timed and traced, with failures converted to structured results
 
 Because agents cannot reach tools except through this class, permissions and
 approval are enforced below the model: a model cannot talk its way past them.
@@ -19,13 +20,14 @@ import fnmatch
 import hashlib
 import json
 import time
+from collections.abc import Callable
 from enum import StrEnum
 from typing import Any, Protocol
 
 import jsonschema
 from pydantic import BaseModel, ValidationError
 
-from ..core.errors import BizOpsError, ToolError
+from ..core.errors import BizOpsError, StaleLease, ToolError
 from ..core.models import PlanStep, RiskLevel, RunState, ToolCall, ToolResult
 from ..memory.store import bm25_scores
 from ..observability import Tracer
@@ -81,6 +83,10 @@ class ToolGateway:
         self.gate: ApprovalGate = gate or AllowAllGate()
         self._executors = list(executors)
         self._specs: dict[str, tuple[ToolSpec, ToolExecutor]] = {}
+        # Set by the orchestrator: raises StaleLease if the worker no longer owns the run.
+        self.fence_guard: Callable[[RunState], None] | None = None
+        # Set by the orchestrator: fenced write of the run state, used for write-ahead intents.
+        self.checkpoint: Callable[[RunState], None] | None = None
         self.refresh()
 
     def refresh(self) -> None:
@@ -152,6 +158,20 @@ class ToolGateway:
             if earlier.ok and earlier.fingerprint == fp:
                 return earlier.model_copy(update={"call_id": call.call_id, "replayed": True})
 
+        # Recovery of an interrupted call. If this step was cut off while a side-effecting call to
+        # this tool was in flight, nobody knows whether it landed. Send exactly that call again, with
+        # its original arguments and therefore its original idempotency key, so the target either
+        # performs it for the first time or recognises it. This holds even when the model words the
+        # call differently on the second attempt, which a live model may do.
+        intent = step.in_flight
+        if spec.side_effect and intent is not None and intent.tool == call.tool:
+            pinned_fp = fingerprint(call.tool, intent.arguments)
+            if pinned_fp != fp:
+                self.tracer.event(
+                    state.tenant_id, state.run_id, "tool.intent_recovered", tool=call.tool, step_id=step.step_id
+                )
+                arguments, fp = intent.arguments, pinned_fp
+
         verdict = self.gate.evaluate(state, step, agent, spec, call.model_copy(update={"arguments": arguments}), fp)
         if verdict.decision == GateDecision.DENY:
             return failed(f"denied by policy: {verdict.reason}", fp=fp)
@@ -164,7 +184,17 @@ class ToolGateway:
             db=self.db,
             actor=agent,
             idempotency_key=f"{state.run_id}:{step.step_id}:{fp}",
+            fencing_token=state.generation,
         )
+        # Last check before acting: a worker whose claim was superseded stops here.
+        if self.fence_guard is not None:
+            self.fence_guard(state)
+        if spec.side_effect and self.checkpoint is not None and state.generation:
+            # Write the intent ahead of the call (only for a claimed run; an unclaimed state is not
+            # being executed by a worker). The write is fenced, so it is also refused if this
+            # worker was superseded.
+            step.in_flight = ToolCall(call_id=call.call_id, tool=call.tool, arguments=arguments)
+            self.checkpoint(state)
         started = time.perf_counter()
         with self.tracer.span(
             state.tenant_id,
@@ -187,6 +217,8 @@ class ToolGateway:
                     untrusted=spec.returns_untrusted or dynamic_untrusted,
                     fingerprint=fp,
                 )
+            except StaleLease:
+                raise  # not a tool failure: this worker must stop, so do not convert it to a result
             except ToolError as exc:
                 result = ToolResult(
                     call_id=call.call_id,
@@ -205,4 +237,7 @@ class ToolGateway:
         if result.untrusted:
             state.tainted = True
         step.tool_calls.append(result)
+        # The outcome is known now (a failed call is retried under the same key, so it is safe too).
+        # The caller checkpoints the record and the cleared intent together.
+        step.in_flight = None
         return result

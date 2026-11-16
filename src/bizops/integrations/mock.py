@@ -29,21 +29,21 @@ class MockControl:
 
     def __init__(self, db: Database):
         self.db = db
+        # Fault counters live in memory, not in the database: a fault is raised inside the
+        # transaction it aborts, and a counter stored there would be rolled back with it.
+        self._faults: dict[tuple[str, str], dict[str, Any]] = {}
 
     def set_fault(
         self, tenant_id: str, operation: str, times: int = 1, retryable: bool = True, message: str = "simulated outage"
     ) -> None:
-        self.db.kv_put(
-            tenant_id, "mock.faults", operation, {"times": times, "retryable": retryable, "message": message}
-        )
+        self._faults[(tenant_id, operation)] = {"times": times, "retryable": retryable, "message": message}
 
     def check(self, tenant_id: str, operation: str) -> None:
         """Raise the configured fault for an operation, consuming one occurrence."""
-        fault = self.db.kv_get(tenant_id, "mock.faults", operation)
+        fault = self._faults.get((tenant_id, operation))
         if not fault or fault["times"] <= 0:
             return
         fault["times"] -= 1
-        self.db.kv_put(tenant_id, "mock.faults", operation, fault)
         raise IntegrationError(f"{operation}: {fault['message']}", retryable=fault["retryable"])
 
     def today(self, tenant_id: str) -> date:

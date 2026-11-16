@@ -13,6 +13,7 @@ accept. That keeps behaviour auditable: what an agent may touch is data, not cod
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -55,6 +56,7 @@ class AgentContext:
     context_builder: ContextBuilder
     tracer: Tracer
     settings: Settings
+    checkpoint: Callable[[RunState], None] | None = None
 
 
 def parse_final(text: str) -> dict[str, Any]:
@@ -156,6 +158,10 @@ class SpecialistAgent:
                 # ApprovalRequired propagates from here to the orchestrator, which suspends the run.
                 result = await ctx.gateway.execute(state, step, self.spec.name, self.spec.allowed_tools, call)
                 tool_results.append(result)
+                if ctx.checkpoint is not None:
+                    # Persist the tool record at once. If this worker dies now, the next one replays
+                    # the call from the record; if this worker was superseded, the write is refused.
+                    ctx.checkpoint(state)
                 payload = result.output if result.ok else {"error": result.error, "retryable": result.retryable}
                 messages.append(
                     LLMMessage(

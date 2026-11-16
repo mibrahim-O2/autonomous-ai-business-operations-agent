@@ -33,3 +33,10 @@ class BudgetExceeded(BizOpsError):
 
 class RunNotFound(BizOpsError):
     """No run with the requested id exists for the tenant."""
+
+
+class StaleLease(BizOpsError):
+    """This worker no longer owns the run: another worker claimed it with a newer generation.
+
+    A worker that sees this must stop at once without writing anything further.
+    """

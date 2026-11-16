@@ -232,10 +232,11 @@ def test_settings_keep_http_surfaces_disabled_by_default(tmp_path):
 
 
 def test_reminder_retry_does_not_email_the_customer_twice(rt):
-    """If recording the reminder fails after the email was sent, the retry must reuse the first send."""
+    """Sending and recording a reminder are one transaction: a failure half-way leaves nothing behind."""
     rt.mock_control.set_fault("demo", "billing.record_reminder", times=1, retryable=True)
     with pytest.raises(ToolError) as first:
         run(rt.mcp.call("billing_send_reminder", {"invoice_id": "INV-1001"}, _ctx(rt, key="rem-1")))
-    assert first.value.retryable and len(rt.db.kv_list("demo", "email.sent")) == 1
+    assert first.value.retryable and rt.db.kv_list("demo", "email.sent") == {}  # the send was rolled back
     result = run(rt.mcp.call("billing_send_reminder", {"invoice_id": "INV-1001"}, _ctx(rt, key="rem-1")))
-    assert result["reminders_sent"] == 1 and len(rt.db.kv_list("demo", "email.sent")) == 1
+    again = run(rt.mcp.call("billing_send_reminder", {"invoice_id": "INV-1001"}, _ctx(rt, key="rem-1")))
+    assert result == again and result["reminders_sent"] == 1 and len(rt.db.kv_list("demo", "email.sent")) == 1

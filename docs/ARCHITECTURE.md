@@ -90,7 +90,35 @@ The run state is saved after every transition. Run statuses: `pending`, `running
 
 A run can stop between steps (pause), inside a step (approval required), or because the process exits. On resume, any step that was in flight is executed again from its start. Tool calls that already completed in that step are returned from the step record instead of being executed again, matched by a hash of tool name and arguments. Side effects are therefore applied once.
 
-Known gap: two processes resuming the same run at the same moment are not yet prevented. This is tracked as an issue and addressed with a run lease in the reliability work.
+### Single writer: leases, fencing and exactly-once side effects
+
+Several workers can share one database, so a run must never be executed by two of them at once, including the case where one worker stalls (a slow model call, a frozen process), loses its lease, and wakes up after another worker has taken over. A lease timeout alone does not cover that case, because the stalled worker does not know its lease expired. The design uses six mechanisms together.
+
+| Mechanism | Where | What it guarantees |
+|---|---|---|
+| Atomic claim | `Database.claim_run` | One conditional `UPDATE` in an immediate transaction tests "unowned or expired" and writes the new owner. Of any number of simultaneous claimers, one succeeds. |
+| Lease and heartbeat | `Orchestrator._heartbeat`, `Database.renew_lease` | A healthy worker renews its lease every third of the lease period (`BIZOPS_RUN_LEASE_SECONDS`, default 60), and every checkpoint renews it too, so a long step does not lose the run. A dead worker stops renewing and the run becomes claimable. |
+| Fencing token | `runs.generation` | Every successful claim increments the generation. It is never reused. The generation identifies which claim a write belongs to. |
+| Conditional state writes | `Database.save_run(fence=...)` | Every checkpoint is `UPDATE ... WHERE lease_owner = ? AND generation = ?`. A superseded worker's write changes nothing and raises `StaleLease`; the worker stops and records `run.stale_worker_stopped`. |
+| Fencing at the target | `Database.run_once`, MCP server `guarded` | Each side-effecting tool call carries the generation. The target keeps the highest generation seen per run and refuses a lower one. This is what stops a worker that had already passed every local check before it stalled. |
+| Idempotency keys | gateway, `Database.run_once` | Each side-effecting call carries a key derived from run, step, tool and arguments. The target stores the result under the key in the same transaction as the effect, so a repeated call returns the first result and does nothing. |
+
+Recovery of an interrupted step: the claiming worker loads the last committed checkpoint only after it holds the claim, resets any step that was in flight, and runs it again. The agent loop checkpoints after every tool call, so calls completed before the interruption are replayed from the record. For the one call that may have been in flight, the gateway saves a write-ahead intent (`PlanStep.in_flight`) before sending it. On recovery the next call to that tool in that step is sent with the recorded arguments, and therefore the same idempotency key, even if the model words it differently the second time. The target then either performs it for the first time or recognises it. If a recovered step finishes without re-issuing the call, `tool.intent_unresolved` is recorded so the unknown outcome is visible.
+
+What happens in the stalled-worker scenario (worker A stalls, worker B takes over and finishes, A wakes):
+
+1. If A wakes before sending the call, the gateway's ownership check, or the fenced write of the intent, raises `StaleLease`. Nothing is sent.
+2. If A had already sent the call when it stalled, the target refuses A's lower generation once B has acted on the run. If B has not acted yet, A's call lands under the shared idempotency key and B's identical call is answered from the stored result. Either way the effect happens once.
+3. A cannot write run state afterwards; its checkpoint is refused, and its lease release is a no-op.
+
+Limits, stated plainly:
+
+- The target-side guarantees are exact for systems that share this database transactionally (the mock integrations and local tools). A real external system is exactly-once only if it honours the idempotency key; fencing at the target additionally needs the vendor, or the adapter in front of it, to keep the high-water mark. `REAL-INTEGRATIONS-SETUP.md` explains what an adapter must do.
+- An effect that is not a single transaction at the vendor (for example an email that was sent although the connection dropped before the response) depends on the vendor's own idempotency support.
+- Ownership is decided by the database, not by clocks, but lease expiry compares timestamps written by the workers. Workers should run with synchronised clocks; skew larger than the lease period could let a run be claimed early, in which case fencing still prevents double writes.
+- The job queue uses the same idea at smaller scale: a job reclaimed after a stall gets a new attempt number and a result reported under an older attempt is discarded.
+
+The regression tests for all of the above are in `tests/test_concurrency.py`.
 
 ## 6. Tool gateway
 
@@ -158,5 +186,5 @@ Known gap: the API key and webhook secret are single shared values and do not bi
 
 | Pull request | Adds |
 |---|---|
-| 3 | Approval policy engine, approvals with history, access control, audit trail, timeouts, backoff, recovery of interrupted runs, run lease, injection defences |
+| 3 | Approval policy engine, approvals with history, access control, audit trail, timeouts, backoff, recovery of interrupted runs, injection defences |
 | 4 | Evaluation framework, dashboard, cost reporting, Docker, deployment guide |

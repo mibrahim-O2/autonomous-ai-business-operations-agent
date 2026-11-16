@@ -7,6 +7,8 @@ the platform and hidden from the model:
   * `tenant_id`        injected from the run, so a model cannot address another tenant
   * `idempotency_key`  injected for side-effecting tools, derived from the run,
                        step, and call fingerprint, so a retried call is not repeated
+  * `fencing_token`    the run's claim generation, so the target refuses a worker
+                       that has been superseded
 
 A session is opened per operation. For an in-process server that costs almost
 nothing and avoids holding a connection across event loops; for a stdio or HTTP
@@ -20,11 +22,11 @@ from typing import Any
 
 from mcp import Client
 
-from ..core.errors import ToolError
+from ..core.errors import StaleLease, ToolError
 from ..core.models import RiskLevel
 from .base import ToolContext, ToolSpec
 
-HIDDEN_PARAMS = ("tenant_id", "idempotency_key")
+HIDDEN_PARAMS = ("tenant_id", "idempotency_key", "fencing_token")
 
 
 class MCPToolExecutor:
@@ -84,6 +86,8 @@ class MCPToolExecutor:
             payload["tenant_id"] = ctx.tenant_id
         if spec.side_effect and "idempotency_key" in accepted and ctx.idempotency_key:
             payload["idempotency_key"] = ctx.idempotency_key
+            if "fencing_token" in accepted and ctx.fencing_token:
+                payload["fencing_token"] = ctx.fencing_token
         try:
             async with self._client() as client:
                 result = await client.call_tool(name, payload)
@@ -93,6 +97,8 @@ class MCPToolExecutor:
             text = result.content[0].text if result.content else "unknown error"
             raise ToolError(f"{name} failed: {text}")
         envelope = result.structured_content or {}
+        if envelope.get("stale"):
+            raise StaleLease(str(envelope.get("error")))
         if not envelope.get("ok", False):
             raise ToolError(
                 str(envelope.get("error", "tool returned no result")), retryable=bool(envelope.get("retryable"))

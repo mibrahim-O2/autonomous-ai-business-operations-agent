@@ -10,8 +10,10 @@ Protocol:
 Conventions every tool follows:
   * `tenant_id` scopes the call. The platform's MCP client injects it from the
     run; the model never chooses it.
-  * Tools with side effects accept an `idempotency_key`. A repeated key returns
-    the stored result without performing the action again.
+  * Tools with side effects accept an `idempotency_key` and a `fencing_token`.
+    A repeated key returns the stored result without performing the action
+    again. A token lower than one already seen for the same run is refused:
+    it comes from a worker that has been superseded.
   * Results use an envelope: {"ok": true, "data": ...} or
     {"ok": false, "error": ..., "retryable": ...}. Transport-level errors are
     reserved for protocol faults.
@@ -29,7 +31,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
 from ..core.config import get_settings
-from ..core.errors import ToolError
+from ..core.errors import StaleLease, ToolError
 from ..integrations import Integrations, build_mock_integrations, seed_demo_data
 from ..integrations.mock import MockControl
 from ..storage import Database
@@ -53,19 +55,27 @@ def create_business_server(integrations: Integrations, db: Database, control: Mo
     server = MCPServer("bizops-business", instructions=INSTRUCTIONS, version="0.2.0")
     crm, email, calendar, billing = integrations.crm, integrations.email, integrations.calendar, integrations.billing
 
-    def guarded(operation: str, tenant_id: str, action: Callable[[], Any], idempotency_key: str = "") -> dict[str, Any]:
-        """Run an adapter call, apply idempotency, and convert failures to the result envelope."""
-        if idempotency_key:
-            stored = db.idempotency_get(tenant_id, idempotency_key)
-            if stored is not None:
-                return {"ok": True, "data": stored, "idempotent_replay": True}
+    def guarded(
+        operation: str, tenant_id: str, action: Callable[[], Any], idempotency_key: str = "", fencing_token: int = 0
+    ) -> dict[str, Any]:
+        """Run an adapter call and convert the outcome to the result envelope.
+
+        Side-effecting calls go through `Database.run_once`, which applies the
+        fencing token and the idempotency key and performs the action in one
+        transaction. The fencing scope is the run id, taken from the key.
+        """
         try:
-            data = action()
+            if idempotency_key:
+                scope = idempotency_key.split(":", 1)[0]
+                data, replayed = db.run_once(
+                    tenant_id, idempotency_key, operation, action, fence_scope=scope, fence_token=fencing_token
+                )
+                return {"ok": True, "data": data, **({"idempotent_replay": True} if replayed else {})}
+            return {"ok": True, "data": action()}
+        except StaleLease as exc:
+            return {"ok": False, "error": str(exc), "retryable": False, "stale": True}
         except ToolError as exc:
             return {"ok": False, "error": str(exc), "retryable": exc.retryable}
-        if idempotency_key:
-            db.idempotency_put(tenant_id, idempotency_key, operation, data)
-        return {"ok": True, "data": data}
 
     def tool(risk: str, untrusted: bool = False):
         return server.tool(meta=_meta(risk, untrusted), annotations=_annotations(risk))
@@ -96,6 +106,7 @@ def create_business_server(integrations: Integrations, db: Database, control: Mo
         fields: dict[str, Any] | None = None,
         tenant_id: str = "demo",
         idempotency_key: str = "",
+        fencing_token: int = 0,
     ) -> dict[str, Any]:
         """Create or update a CRM contact. Returns the stored record and whether it was created."""
 
@@ -107,18 +118,28 @@ def create_business_server(integrations: Integrations, db: Database, control: Mo
             )
             return {"created": created, "contact": contact}
 
-        return guarded("crm.upsert_contact", tenant_id, action, idempotency_key)
+        return guarded("crm.upsert_contact", tenant_id, action, idempotency_key, fencing_token)
 
     @tool("low")
-    def crm_add_note(email: str, note: str, tenant_id: str = "demo", idempotency_key: str = "") -> dict[str, Any]:
+    def crm_add_note(
+        email: str, note: str, tenant_id: str = "demo", idempotency_key: str = "", fencing_token: int = 0
+    ) -> dict[str, Any]:
         """Append an internal note to a CRM contact."""
         return guarded(
-            "crm.add_note", tenant_id, lambda: {"notes": crm.add_note(tenant_id, email, note, "agent")}, idempotency_key
+            "crm.add_note",
+            tenant_id,
+            lambda: {"notes": crm.add_note(tenant_id, email, note, "agent")},
+            idempotency_key,
+            fencing_token,
         )
 
     @tool("high")
     def crm_merge_contacts(
-        primary_email: str, duplicate_email: str, tenant_id: str = "demo", idempotency_key: str = ""
+        primary_email: str,
+        duplicate_email: str,
+        tenant_id: str = "demo",
+        idempotency_key: str = "",
+        fencing_token: int = 0,
     ) -> dict[str, Any]:
         """Merge a duplicate contact into a primary contact. IRREVERSIBLE: the duplicate is archived."""
         return guarded(
@@ -126,6 +147,7 @@ def create_business_server(integrations: Integrations, db: Database, control: Mo
             tenant_id,
             lambda: {"contact": crm.merge_contacts(tenant_id, primary_email, duplicate_email)},
             idempotency_key,
+            fencing_token,
         )
 
     # Email -------------------------------------------------------------------
@@ -141,20 +163,34 @@ def create_business_server(integrations: Integrations, db: Database, control: Mo
 
     @tool("low")
     def email_create_draft(
-        to: str, subject: str, body: str, tenant_id: str = "demo", idempotency_key: str = ""
+        to: str, subject: str, body: str, tenant_id: str = "demo", idempotency_key: str = "", fencing_token: int = 0
     ) -> dict[str, Any]:
         """Save an email draft. The draft is NOT sent."""
         return guarded(
-            "email.create_draft", tenant_id, lambda: email.create_draft(tenant_id, to, subject, body), idempotency_key
+            "email.create_draft",
+            tenant_id,
+            lambda: email.create_draft(tenant_id, to, subject, body),
+            idempotency_key,
+            fencing_token,
         )
 
     @tool("high")
     def email_send(
-        to: str, subject: str, body: str, draft_id: str = "", tenant_id: str = "demo", idempotency_key: str = ""
+        to: str,
+        subject: str,
+        body: str,
+        draft_id: str = "",
+        tenant_id: str = "demo",
+        idempotency_key: str = "",
+        fencing_token: int = 0,
     ) -> dict[str, Any]:
         """Send an email to a recipient. EXTERNAL: the message leaves the organisation."""
         return guarded(
-            "email.send", tenant_id, lambda: email.send(tenant_id, to, subject, body, draft_id or None), idempotency_key
+            "email.send",
+            tenant_id,
+            lambda: email.send(tenant_id, to, subject, body, draft_id or None),
+            idempotency_key,
+            fencing_token,
         )
 
     # Calendar ----------------------------------------------------------------
@@ -177,6 +213,7 @@ def create_business_server(integrations: Integrations, db: Database, control: Mo
         attendees: list[str] | None = None,
         tenant_id: str = "demo",
         idempotency_key: str = "",
+        fencing_token: int = 0,
     ) -> dict[str, Any]:
         """Book a calendar event. Fails if the slot is already taken."""
         return guarded(
@@ -184,13 +221,20 @@ def create_business_server(integrations: Integrations, db: Database, control: Mo
             tenant_id,
             lambda: calendar.create_event(tenant_id, title, start, duration_minutes, attendees or []),
             idempotency_key,
+            fencing_token,
         )
 
     @tool("medium")
-    def calendar_cancel_event(event_id: str, tenant_id: str = "demo", idempotency_key: str = "") -> dict[str, Any]:
+    def calendar_cancel_event(
+        event_id: str, tenant_id: str = "demo", idempotency_key: str = "", fencing_token: int = 0
+    ) -> dict[str, Any]:
         """Cancel a calendar event."""
         return guarded(
-            "calendar.cancel_event", tenant_id, lambda: calendar.cancel_event(tenant_id, event_id), idempotency_key
+            "calendar.cancel_event",
+            tenant_id,
+            lambda: calendar.cancel_event(tenant_id, event_id),
+            idempotency_key,
+            fencing_token,
         )
 
     # Billing -----------------------------------------------------------------
@@ -218,7 +262,9 @@ def create_business_server(integrations: Integrations, db: Database, control: Mo
         )
 
     @tool("high")
-    def billing_send_reminder(invoice_id: str, tenant_id: str = "demo", idempotency_key: str = "") -> dict[str, Any]:
+    def billing_send_reminder(
+        invoice_id: str, tenant_id: str = "demo", idempotency_key: str = "", fencing_token: int = 0
+    ) -> dict[str, Any]:
         """Email a payment reminder for an invoice and record it. EXTERNAL: contacts the customer."""
 
         def action() -> dict[str, Any]:
@@ -229,22 +275,22 @@ def create_business_server(integrations: Integrations, db: Database, control: Mo
                 f"This is a reminder that invoice {invoice_id} for {invoice['amount']:.2f} {invoice['currency']}, "
                 f"due on {invoice['due_date']}, is still outstanding. Please let us know if you have any questions."
             )
-            # Two systems are touched. If recording fails after the email went out, a retry must not
-            # email the customer twice, so the send is remembered under its own key.
-            send_key = f"{idempotency_key}:email" if idempotency_key else ""
-            sent = db.idempotency_get(tenant_id, send_key) if send_key else None
-            if sent is None:
-                sent = email.send(tenant_id, invoice["customer_email"], f"Payment reminder: {invoice_id}", body)
-                if send_key:
-                    db.idempotency_put(tenant_id, send_key, "billing.send_reminder.email", sent)
+            # Two systems are touched. Both writes happen inside the one transaction opened by
+            # `guarded`, so a failure while recording rolls the send back and a retry starts clean.
+            sent = email.send(tenant_id, invoice["customer_email"], f"Payment reminder: {invoice_id}", body)
             updated = billing.record_reminder(tenant_id, invoice_id)
             return {"invoice_id": invoice_id, "sent_id": sent["sent_id"], "reminders_sent": updated["reminders_sent"]}
 
-        return guarded("billing.send_reminder", tenant_id, action, idempotency_key)
+        return guarded("billing.send_reminder", tenant_id, action, idempotency_key, fencing_token)
 
     @tool("high")
     def billing_issue_refund(
-        invoice_id: str, amount: float, reason: str, tenant_id: str = "demo", idempotency_key: str = ""
+        invoice_id: str,
+        amount: float,
+        reason: str,
+        tenant_id: str = "demo",
+        idempotency_key: str = "",
+        fencing_token: int = 0,
     ) -> dict[str, Any]:
         """Refund part or all of a paid invoice. FINANCIAL and IRREVERSIBLE."""
         return guarded(
@@ -252,6 +298,7 @@ def create_business_server(integrations: Integrations, db: Database, control: Mo
             tenant_id,
             lambda: billing.issue_refund(tenant_id, invoice_id, amount, reason),
             idempotency_key,
+            fencing_token,
         )
 
     # Resources: read-only context a host can attach without a tool call --------

@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     max_replans: int = Field(default=2, ge=0, le=10)
     max_run_cost_usd: float = Field(default=1.0, ge=0)
     context_token_budget: int = Field(default=6000, ge=500)
+    # How long a worker's claim on a run lasts without renewal. A worker renews at each
+    # checkpoint and from a heartbeat; another worker may take over only after expiry.
+    run_lease_seconds: float = Field(default=60.0, gt=0)
 
     # Load the fictional business records and policy documents for the default tenant at start-up.
     seed_demo_data: bool = True

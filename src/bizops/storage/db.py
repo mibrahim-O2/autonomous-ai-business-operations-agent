@@ -17,11 +17,11 @@ import sqlite3
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from ..core.errors import RunNotFound
+from ..core.errors import RunNotFound, StaleLease
 from ..core.models import RunState
 
 MIGRATIONS: list[str] = [
@@ -124,6 +124,19 @@ MIGRATIONS: list[str] = [
         PRIMARY KEY (tenant_id, key)
     );
     """,
+    # 3: run leases with fencing, and fencing high-water marks for target systems
+    """
+    ALTER TABLE runs ADD COLUMN lease_owner TEXT;
+    ALTER TABLE runs ADD COLUMN lease_expires_at TEXT;
+    ALTER TABLE runs ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;
+
+    CREATE TABLE fence_marks (
+        tenant_id TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        token INTEGER NOT NULL,
+        PRIMARY KEY (tenant_id, scope)
+    );
+    """,
 ]
 
 
@@ -177,26 +190,157 @@ class Database:
             self._conn.close()
 
     # Runs --------------------------------------------------------------------
-    def save_run(self, state: RunState) -> None:
-        """Checkpoint: write the full run state. Called after every transition."""
+    def save_run(self, state: RunState, fence: tuple[str, int] | None = None, lease_seconds: float = 60.0) -> None:
+        """Checkpoint: write the full run state. Called after every transition.
+
+        With `fence` (owner, generation) the write is conditional: it succeeds only
+        while that worker still holds the run under that generation, and it renews
+        the lease in the same statement. A worker whose claim was superseded gets
+        `StaleLease` and nothing is written. Without `fence` the row is inserted
+        (run creation) and an existing row is left untouched.
+        """
         state.updated_at = datetime.now(UTC)
-        self.execute(
-            """INSERT INTO runs(run_id, tenant_id, status, objective, idempotency_key, state_json,
-                                created_at, updated_at)
-               VALUES(?,?,?,?,?,?,?,?)
-               ON CONFLICT(run_id) DO UPDATE SET status=excluded.status, state_json=excluded.state_json,
-                                                 updated_at=excluded.updated_at""",
+        if fence is None:
+            self.execute(
+                """INSERT INTO runs(run_id, tenant_id, status, objective, idempotency_key, state_json,
+                                    created_at, updated_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    state.run_id,
+                    state.tenant_id,
+                    state.status.value,
+                    state.task.objective,
+                    state.task.idempotency_key,
+                    state.model_dump_json(),
+                    state.created_at.isoformat(),
+                    state.updated_at.isoformat(),
+                ),
+            )
+            return
+        owner, generation = fence
+        expires = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).isoformat(timespec="milliseconds")
+        cursor = self.execute(
+            """UPDATE runs SET status=?, state_json=?, updated_at=?, lease_expires_at=?
+               WHERE tenant_id=? AND run_id=? AND lease_owner=? AND generation=?""",
             (
-                state.run_id,
-                state.tenant_id,
                 state.status.value,
-                state.task.objective,
-                state.task.idempotency_key,
                 state.model_dump_json(),
-                state.created_at.isoformat(),
                 state.updated_at.isoformat(),
+                expires,
+                state.tenant_id,
+                state.run_id,
+                owner,
+                generation,
             ),
         )
+        if cursor.rowcount == 0:
+            raise StaleLease(f"worker {owner} (generation {generation}) no longer owns run {state.run_id}")
+
+    # Leases and fencing ------------------------------------------------------
+    def claim_run(
+        self, tenant_id: str, run_id: str, owner: str, lease_seconds: float, now: datetime | None = None
+    ) -> int | None:
+        """Atomically take ownership of a run. Returns the new generation, or None if it is held.
+
+        One UPDATE inside an immediate transaction both tests "unowned or expired"
+        and writes the new owner, so two workers cannot both succeed. The generation
+        is incremented on every successful claim and serves as the fencing token.
+        """
+        moment = now or datetime.now(UTC)
+        expires = (moment + timedelta(seconds=lease_seconds)).isoformat(timespec="milliseconds")
+        with self.transaction() as conn:
+            claimed = conn.execute(
+                """UPDATE runs SET lease_owner=?, lease_expires_at=?, generation=generation+1
+                   WHERE tenant_id=? AND run_id=? AND (lease_owner IS NULL OR lease_expires_at<?)""",
+                (owner, expires, tenant_id, run_id, moment.isoformat(timespec="milliseconds")),
+            ).rowcount
+            if not claimed:
+                exists = conn.execute(
+                    "SELECT 1 FROM runs WHERE tenant_id=? AND run_id=?", (tenant_id, run_id)
+                ).fetchone()
+                if exists is None:
+                    raise RunNotFound(f"run {run_id} not found for tenant {tenant_id}")
+                return None
+            row = conn.execute("SELECT generation FROM runs WHERE tenant_id=? AND run_id=?", (tenant_id, run_id))
+            return int(row.fetchone()["generation"])
+
+    def renew_lease(self, tenant_id: str, run_id: str, owner: str, generation: int, lease_seconds: float) -> bool:
+        """Heartbeat. Returns False when the lease has been lost."""
+        expires = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).isoformat(timespec="milliseconds")
+        return (
+            self.execute(
+                "UPDATE runs SET lease_expires_at=? WHERE tenant_id=? AND run_id=? AND lease_owner=? AND generation=?",
+                (expires, tenant_id, run_id, owner, generation),
+            ).rowcount
+            > 0
+        )
+
+    def release_lease(self, tenant_id: str, run_id: str, owner: str, generation: int) -> None:
+        """Give the run up. A no-op if this worker no longer owns it. The generation is kept."""
+        self.execute(
+            "UPDATE runs SET lease_owner=NULL, lease_expires_at=NULL "
+            "WHERE tenant_id=? AND run_id=? AND lease_owner=? AND generation=?",
+            (tenant_id, run_id, owner, generation),
+        )
+
+    def lease_is_current(self, tenant_id: str, run_id: str, owner: str, generation: int) -> bool:
+        rows = self.query(
+            "SELECT 1 FROM runs WHERE tenant_id=? AND run_id=? AND lease_owner=? AND generation=?",
+            (tenant_id, run_id, owner, generation),
+        )
+        return bool(rows)
+
+    def get_lease(self, tenant_id: str, run_id: str) -> dict[str, Any]:
+        rows = self.query(
+            "SELECT lease_owner, lease_expires_at, generation FROM runs WHERE tenant_id=? AND run_id=?",
+            (tenant_id, run_id),
+        )
+        if not rows:
+            raise RunNotFound(f"run {run_id} not found for tenant {tenant_id}")
+        return dict(rows[0])
+
+    def run_once(
+        self, tenant_id: str, key: str, operation: str, action: Any, *, fence_scope: str = "", fence_token: int = 0
+    ) -> tuple[Any, bool]:
+        """Perform a side effect at most once per idempotency key, with fencing. Returns (result, replayed).
+
+        Everything happens in one transaction:
+          1. Fencing: the highest token seen for the scope is kept. A caller with a
+             lower token is a superseded worker and is refused with `StaleLease`.
+          2. Idempotency: if the key already has a result, that result is returned
+             and the action does not run.
+          3. Otherwise the action runs and its result is stored under the key.
+        If the action fails, or the process dies part-way, the transaction rolls
+        back, so neither a partial effect nor a reservation is left behind. This
+        is exact for systems that live in this database (the mock integrations).
+        A real external system must be given the key and token so that it can
+        apply the same two rules itself.
+        """
+        with self.transaction() as conn:
+            if fence_scope and fence_token:
+                row = conn.execute(
+                    "SELECT token FROM fence_marks WHERE tenant_id=? AND scope=?", (tenant_id, fence_scope)
+                ).fetchone()
+                if row is not None and fence_token < row["token"]:
+                    raise StaleLease(f"stale fencing token {fence_token} for {fence_scope}; current is {row['token']}")
+                conn.execute(
+                    "INSERT INTO fence_marks(tenant_id, scope, token) VALUES(?,?,?) "
+                    "ON CONFLICT(tenant_id, scope) DO UPDATE SET token=excluded.token",
+                    (tenant_id, fence_scope, fence_token),
+                )
+            if key:
+                stored = conn.execute(
+                    "SELECT result_json FROM idempotency WHERE tenant_id=? AND key=?", (tenant_id, key)
+                ).fetchone()
+                if stored is not None:
+                    return json.loads(stored["result_json"]), True
+            result = action()
+            if key:
+                conn.execute(
+                    "INSERT INTO idempotency(tenant_id, key, operation, result_json, created_at) VALUES(?,?,?,?,?)",
+                    (tenant_id, key, operation, json.dumps(result, default=str), _now()),
+                )
+            return result, False
 
     def load_run(self, tenant_id: str, run_id: str) -> RunState:
         rows = self.query("SELECT state_json FROM runs WHERE tenant_id=? AND run_id=?", (tenant_id, run_id))
