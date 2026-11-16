@@ -73,6 +73,57 @@ MIGRATIONS: list[str] = [
         PRIMARY KEY (tenant_id, namespace, key)
     );
     """,
+    # 2: knowledge base, job queue, idempotency records
+    """
+    CREATE TABLE documents (
+        doc_id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        doc_type TEXT NOT NULL,
+        source TEXT NOT NULL,
+        trusted INTEGER NOT NULL DEFAULT 1,
+        content_hash TEXT NOT NULL,
+        metadata_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_documents_tenant ON documents(tenant_id, doc_type);
+
+    CREATE TABLE chunks (
+        chunk_id TEXT PRIMARY KEY,
+        doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+        tenant_id TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        section TEXT NOT NULL,
+        text TEXT NOT NULL,
+        embedding BLOB NOT NULL
+    );
+    CREATE INDEX idx_chunks_tenant ON chunks(tenant_id, doc_id);
+
+    CREATE TABLE jobs (
+        job_id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        run_at TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        dedupe_key TEXT,
+        result_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_jobs_due ON jobs(status, run_at);
+    CREATE UNIQUE INDEX idx_jobs_dedupe ON jobs(tenant_id, dedupe_key) WHERE dedupe_key IS NOT NULL;
+
+    CREATE TABLE idempotency (
+        tenant_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (tenant_id, key)
+    );
+    """,
 ]
 
 
@@ -242,4 +293,15 @@ class Database:
                 "DELETE FROM kv WHERE tenant_id=? AND namespace=? AND key=?", (tenant_id, namespace, key)
             ).rowcount
             > 0
+        )
+
+    # Idempotency (side-effecting integration calls) ----------------------------
+    def idempotency_get(self, tenant_id: str, key: str) -> Any | None:
+        rows = self.query("SELECT result_json FROM idempotency WHERE tenant_id=? AND key=?", (tenant_id, key))
+        return json.loads(rows[0]["result_json"]) if rows else None
+
+    def idempotency_put(self, tenant_id: str, key: str, operation: str, result: Any) -> None:
+        self.execute(
+            "INSERT OR IGNORE INTO idempotency(tenant_id, key, operation, result_json, created_at) VALUES(?,?,?,?,?)",
+            (tenant_id, key, operation, json.dumps(result, default=str), _now()),
         )

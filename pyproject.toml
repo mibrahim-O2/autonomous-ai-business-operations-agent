@@ -13,6 +13,11 @@ license = { text = "MIT" }
 dependencies = [
   "pydantic>=2.7,<3",
   "pydantic-settings>=2.3,<3",
+  "mcp>=2,<3",
+  "httpx>=0.27,<1",
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "jsonschema>=4.20",
 ]
 
 [project.optional-dependencies]
@@ -22,6 +27,7 @@ openai = ["openai>=1.50"]
 
 [project.scripts]
 bizops = "bizops.cli:main"
+bizops-mcp = "bizops.mcp_server.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

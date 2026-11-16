@@ -27,6 +27,9 @@ class ToolContext:
     run_id: str
     db: Database
     actor: str = "agent"
+    # Stable per (run, step, call). Tools with side effects pass it on so that a
+    # repeated call is recognised by the target system and not performed twice.
+    idempotency_key: str = ""
 
 
 @dataclass

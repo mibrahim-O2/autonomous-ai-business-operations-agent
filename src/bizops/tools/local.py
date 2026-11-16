@@ -1,50 +1,19 @@
-"""In-process tools.
+"""In-process tools: memory, knowledge retrieval, and internal task creation.
 
-These built-in tools give the first workflow something real to act on: they
-read and write demo business records held in the database's key-value store.
-The integration layer exposes richer versions of the same operations through
-MCP; the tool names are kept stable so agents do not change.
+Tools that touch business systems (CRM, email, calendar, billing) are served by
+the MCP server. What stays local are tools over the platform's own stores.
 """
 
 from __future__ import annotations
 
-from datetime import date, timedelta
 from typing import Any
 
 from pydantic import BaseModel, Field
 
-from ..core.errors import ToolError
 from ..core.models import RiskLevel, new_id
+from ..knowledge import KnowledgeBase
 from ..memory.store import MemoryStore
 from .base import ToolContext, ToolSpec
-
-
-class FindContact(BaseModel):
-    email: str = Field(min_length=3)
-
-
-class UpsertContact(BaseModel):
-    email: str = Field(min_length=3, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-    name: str = ""
-    company: str = ""
-    fields: dict[str, Any] = Field(default_factory=dict)
-
-
-class AddNote(BaseModel):
-    email: str
-    note: str = Field(min_length=1, max_length=2000)
-
-
-class CreateDraft(BaseModel):
-    to: str = Field(pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-    subject: str = Field(min_length=1, max_length=200)
-    body: str = Field(min_length=1, max_length=5000)
-
-
-class FindSlots(BaseModel):
-    days_ahead: int = Field(default=5, ge=1, le=30)
-    duration_minutes: int = Field(default=30, ge=15, le=240)
-    start_date: date | None = None
 
 
 class MemorySearch(BaseModel):
@@ -52,54 +21,44 @@ class MemorySearch(BaseModel):
     limit: int = Field(default=5, ge=1, le=20)
 
 
-class LocalToolExecutor:
-    """Registers the built-in tools and dispatches calls to them."""
+class KnowledgeSearch(BaseModel):
+    query: str = Field(min_length=2)
+    limit: int = Field(default=4, ge=1, le=10)
+    doc_types: list[str] = Field(default_factory=list, description="Restrict to these document types, e.g. policy")
+    trusted_only: bool = Field(default=False, description="Exclude documents that originated outside the organisation")
 
-    def __init__(self, memory: MemoryStore):
-        self.memory = memory
+
+class CreateTask(BaseModel):
+    title: str = Field(min_length=3, max_length=200)
+    detail: str = Field(default="", max_length=2000)
+    assignee: str = "operations"
+
+
+class LocalToolExecutor:
+    def __init__(self, memory: MemoryStore, knowledge: KnowledgeBase):
+        self.memory, self.knowledge = memory, knowledge
         self._specs: dict[str, ToolSpec] = {}
         for spec in (
             ToolSpec(
-                "crm_find_contact",
-                "Look up a CRM contact by email address.",
-                RiskLevel.READ,
-                FindContact,
-                handler=self._find_contact,
-            ),
-            ToolSpec(
-                "crm_upsert_contact",
-                "Create or update a CRM contact. Returns the stored record.",
-                RiskLevel.LOW,
-                UpsertContact,
-                handler=self._upsert_contact,
-            ),
-            ToolSpec(
-                "crm_add_note",
-                "Append an internal note to a CRM contact.",
-                RiskLevel.LOW,
-                AddNote,
-                handler=self._add_note,
-            ),
-            ToolSpec(
-                "email_create_draft",
-                "Save an email draft. The draft is NOT sent.",
-                RiskLevel.LOW,
-                CreateDraft,
-                handler=self._create_draft,
-            ),
-            ToolSpec(
-                "calendar_find_slots",
-                "List free meeting slots on upcoming business days.",
-                RiskLevel.READ,
-                FindSlots,
-                handler=self._find_slots,
-            ),
-            ToolSpec(
                 "memory_search",
-                "Search long-term memory (facts and past runs) for relevant knowledge.",
+                "Search long-term memory (facts learned and past runs).",
                 RiskLevel.READ,
                 MemorySearch,
                 handler=self._memory_search,
+            ),
+            ToolSpec(
+                "kb_search",
+                "Search the document knowledge base (policies, playbooks). Returns passages with citations.",
+                RiskLevel.READ,
+                KnowledgeSearch,
+                handler=self._kb_search,
+            ),
+            ToolSpec(
+                "ops_create_task",
+                "Create an internal task for a person to follow up.",
+                RiskLevel.LOW,
+                CreateTask,
+                handler=self._create_task,
             ),
         ):
             self._specs[spec.name] = spec
@@ -116,63 +75,39 @@ class LocalToolExecutor:
         parsed = spec.input_model.model_validate(arguments) if spec.input_model else arguments
         return await spec.handler(parsed, ctx)
 
-    # Handlers ----------------------------------------------------------------
-    async def _find_contact(self, args: FindContact, ctx: ToolContext) -> dict[str, Any]:
-        contact = ctx.db.kv_get(ctx.tenant_id, "crm.contacts", args.email.lower())
-        return {"found": contact is not None, "contact": contact}
-
-    async def _upsert_contact(self, args: UpsertContact, ctx: ToolContext) -> dict[str, Any]:
-        key = args.email.lower()
-        existing = ctx.db.kv_get(ctx.tenant_id, "crm.contacts", key) or {}
-        contact = {
-            **existing,
-            "email": key,
-            **{k: v for k, v in {"name": args.name, "company": args.company}.items() if v},
-            **args.fields,
-        }
-        contact.setdefault("notes", [])
-        ctx.db.kv_put(ctx.tenant_id, "crm.contacts", key, contact)
-        return {"created": not existing, "contact": contact}
-
-    async def _add_note(self, args: AddNote, ctx: ToolContext) -> dict[str, Any]:
-        key = args.email.lower()
-        contact = ctx.db.kv_get(ctx.tenant_id, "crm.contacts", key)
-        if contact is None:
-            raise ToolError(f"no CRM contact with email {key}")
-        contact.setdefault("notes", []).append({"by": ctx.actor, "run_id": ctx.run_id, "text": args.note})
-        ctx.db.kv_put(ctx.tenant_id, "crm.contacts", key, contact)
-        return {"notes": len(contact["notes"])}
-
-    async def _create_draft(self, args: CreateDraft, ctx: ToolContext) -> dict[str, Any]:
-        draft_id = new_id("draft")
-        ctx.db.kv_put(
-            ctx.tenant_id,
-            "email.drafts",
-            draft_id,
-            {
-                "draft_id": draft_id,
-                "to": args.to,
-                "subject": args.subject,
-                "body": args.body,
-                "status": "draft",
-                "run_id": ctx.run_id,
-            },
-        )
-        return {"draft_id": draft_id, "status": "draft"}
-
-    async def _find_slots(self, args: FindSlots, ctx: ToolContext) -> dict[str, Any]:
-        booked = {e["start"] for e in ctx.db.kv_list(ctx.tenant_id, "calendar.events").values()}
-        day, slots = args.start_date or date.today(), []
-        while len(slots) < 4 and (day - (args.start_date or date.today())).days <= args.days_ahead:
-            day += timedelta(days=1)
-            if day.weekday() >= 5:
-                continue
-            for hour in (10, 14):
-                start = f"{day.isoformat()}T{hour:02d}:00"
-                if start not in booked and len(slots) < 4:
-                    slots.append({"start": start, "duration_minutes": args.duration_minutes})
-        return {"slots": slots}
-
     async def _memory_search(self, args: MemorySearch, ctx: ToolContext) -> dict[str, Any]:
         hits = self.memory.search(ctx.tenant_id, args.query, limit=args.limit)
         return {"results": [{"kind": h.kind, "text": h.text, "score": h.score} for h in hits]}
+
+    async def _kb_search(self, args: KnowledgeSearch, ctx: ToolContext) -> dict[str, Any]:
+        hits = self.knowledge.search(
+            ctx.tenant_id,
+            args.query,
+            limit=args.limit,
+            doc_types=args.doc_types or None,
+            trusted_only=args.trusted_only,
+        )
+        results = [
+            {"citation": h.citation, "text": h.text, "score": h.score, "doc_type": h.doc_type, "trusted": h.trusted}
+            for h in hits
+        ]
+        # The gateway reads this marker: a result that includes outside material taints the run.
+        return {"results": results, "_untrusted": any(not h.trusted for h in hits)}
+
+    async def _create_task(self, args: CreateTask, ctx: ToolContext) -> dict[str, Any]:
+        # The idempotency key makes a replayed call return the same task instead of a second one.
+        key = ctx.idempotency_key or new_id("k")
+        existing = ctx.db.idempotency_get(ctx.tenant_id, key)
+        if existing is not None:
+            return existing
+        task = {
+            "task_id": new_id("optask"),
+            "title": args.title,
+            "detail": args.detail,
+            "assignee": args.assignee,
+            "status": "open",
+            "run_id": ctx.run_id,
+        }
+        ctx.db.kv_put(ctx.tenant_id, "ops.tasks", task["task_id"], task)
+        ctx.db.idempotency_put(ctx.tenant_id, key, "ops.create_task", task)
+        return task

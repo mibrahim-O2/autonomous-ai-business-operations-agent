@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     max_run_cost_usd: float = Field(default=1.0, ge=0)
     context_token_budget: int = Field(default=6000, ge=500)
 
+    # Load the fictional business records and policy documents for the default tenant at start-up.
+    seed_demo_data: bool = True
+    # Shared secrets. Unset means the corresponding HTTP surface is disabled, never open.
+    api_key: SecretStr | None = None
+    webhook_secret: SecretStr | None = None
+
     log_format: str = "text"
     log_level: str = "INFO"
 

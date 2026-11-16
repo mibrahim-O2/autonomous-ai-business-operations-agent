@@ -15,16 +15,19 @@ approval are enforced below the model: a model cannot talk its way past them.
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import time
 from enum import StrEnum
 from typing import Any, Protocol
 
+import jsonschema
 from pydantic import BaseModel, ValidationError
 
 from ..core.errors import BizOpsError, ToolError
 from ..core.models import PlanStep, RiskLevel, RunState, ToolCall, ToolResult
+from ..memory.store import bm25_scores
 from ..observability import Tracer
 from ..storage import Database
 from .base import ToolContext, ToolExecutor, ToolSpec
@@ -92,8 +95,24 @@ class ToolGateway:
         entry = self._specs.get(name)
         return entry[0] if entry else None
 
-    def specs_for(self, allowed: list[str]) -> list[ToolSpec]:
-        return [self._specs[name][0] for name in allowed if name in self._specs]
+    @staticmethod
+    def is_allowed(tool: str, allowed: list[str]) -> bool:
+        """Allow-lists may name tools exactly or with shell-style patterns such as 'billing_*'."""
+        return any(fnmatch.fnmatchcase(tool, pattern) for pattern in allowed)
+
+    def specs_for(self, allowed: list[str], query: str | None = None, limit: int | None = None) -> list[ToolSpec]:
+        """Tools an agent may use. With `query` and `limit`, return only the most relevant ones.
+
+        Tool selection matters once an agent has many tools: offering the model a
+        short, relevant list improves its choices and saves context. Relevance is
+        BM25 over tool names and descriptions.
+        """
+        permitted = [spec for name, (spec, _) in self._specs.items() if self.is_allowed(name, allowed)]
+        if query is None or limit is None or len(permitted) <= limit:
+            return permitted
+        scores = bm25_scores(query, [f"{s.name.replace('_', ' ')} {s.description}" for s in permitted])
+        ranked = sorted(zip(permitted, scores, strict=True), key=lambda pair: -pair[1])
+        return [spec for spec, _ in ranked[:limit]]
 
     def all_specs(self) -> list[ToolSpec]:
         return [entry[0] for entry in self._specs.values()]
@@ -112,7 +131,7 @@ class ToolGateway:
         if entry is None:
             return failed(f"unknown tool '{call.tool}'")
         spec, executor = entry
-        if call.tool not in allowed:
+        if not self.is_allowed(call.tool, allowed):
             return failed(f"agent '{agent}' is not permitted to use '{call.tool}'")
         arguments = call.arguments
         if spec.input_model is not None:
@@ -121,10 +140,12 @@ class ToolGateway:
             except ValidationError as exc:
                 problems = "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors())
                 return failed(f"invalid arguments: {problems}")
-        else:
-            missing = [k for k in spec.input_schema.get("required", []) if k not in arguments]
-            if missing:
-                return failed(f"invalid arguments: missing {missing}")
+        elif spec.input_schema:
+            # Tools discovered over MCP describe their arguments with JSON Schema.
+            errors = sorted(jsonschema.Draft202012Validator(spec.input_schema).iter_errors(arguments), key=str)
+            if errors:
+                problems = "; ".join(f"{'.'.join(map(str, e.path)) or 'arguments'}: {e.message}" for e in errors[:3])
+                return failed(f"invalid arguments: {problems}")
 
         fp = fingerprint(call.tool, arguments)
         for earlier in step.tool_calls:
@@ -137,7 +158,13 @@ class ToolGateway:
         if verdict.decision == GateDecision.REQUIRE_APPROVAL:
             raise ApprovalRequired(verdict, call.model_copy(update={"arguments": arguments}), spec.name, spec.risk)
 
-        ctx = ToolContext(tenant_id=state.tenant_id, run_id=state.run_id, db=self.db, actor=agent)
+        ctx = ToolContext(
+            tenant_id=state.tenant_id,
+            run_id=state.run_id,
+            db=self.db,
+            actor=agent,
+            idempotency_key=f"{state.run_id}:{step.step_id}:{fp}",
+        )
         started = time.perf_counter()
         with self.tracer.span(
             state.tenant_id,
@@ -150,12 +177,14 @@ class ToolGateway:
         ) as span:
             try:
                 output = await executor.call(call.tool, arguments, ctx)
+                # A tool may flag an individual result as containing outside-authored text.
+                dynamic_untrusted = isinstance(output, dict) and bool(output.pop("_untrusted", False))
                 result = ToolResult(
                     call_id=call.call_id,
                     tool=call.tool,
                     ok=True,
                     output=output,
-                    untrusted=spec.returns_untrusted,
+                    untrusted=spec.returns_untrusted or dynamic_untrusted,
                     fingerprint=fp,
                 )
             except ToolError as exc:
