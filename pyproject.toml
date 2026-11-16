@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autonomous-ai-business-operations-agent"
+version = "0.1.0"
+description = "Multi-agent business operations platform with MCP tools, agentic RAG, memory, and human-in-the-loop execution control."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Muhammad Ibrahim" }]
+license = { text = "MIT" }
+dependencies = [
+  "pydantic>=2.7,<3",
+  "pydantic-settings>=2.3,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+anthropic = ["anthropic>=0.40"]
+openai = ["openai>=1.50"]
+
+[project.scripts]
+bizops = "bizops.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
