@@ -41,7 +41,8 @@ class AgentSpec:
     allowed_tools: list[str]
     actions: list[str]
     prompt_version: str = "1"
-    max_turns: int = 6
+    max_turns: int = 12
+    max_tools_offered: int = 8
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -93,7 +94,12 @@ class SpecialistAgent:
             LLMMessage(role="system", content=f"{self.spec.system_prompt}\n\n{SAFETY_RULES}"),
             LLMMessage(role="user", content=json.dumps(envelope, default=str)),
         ]
-        tools = [spec.schema() for spec in ctx.gateway.specs_for(self.spec.allowed_tools)]
+        # Offer only the most relevant permitted tools when the agent has many (tool selection).
+        selection_query = f"{step.action.replace('_', ' ')} {step.description}"
+        tools = [
+            spec.schema()
+            for spec in ctx.gateway.specs_for(self.spec.allowed_tools, selection_query, self.spec.max_tools_offered)
+        ]
         tool_results: list[ToolResult] = []
 
         for _ in range(self.spec.max_turns):

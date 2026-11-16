@@ -25,8 +25,23 @@ _TOKEN = re.compile(r"[a-z0-9]+")
 _STOP = frozenset("a an and are as at be by for from has in is it of on or that the to was with".split())
 
 
+def stem(token: str) -> str:
+    """Very light suffix stripping so that 'approve', 'approved', and 'approval' share a term.
+
+    This is not a linguistic stemmer. It only has to be consistent, because the
+    same function is applied to documents and to queries.
+    """
+    if len(token) <= 4 or token.isdigit():
+        return token
+    for suffix in ("ing", "ed", "al", "es", "s"):
+        if token.endswith(suffix) and len(token) - len(suffix) >= 4:
+            token = token[: -len(suffix)]
+            break
+    return token[:-1] if token.endswith("e") and len(token) > 4 else token
+
+
 def tokenize(text: str) -> list[str]:
-    return [t for t in _TOKEN.findall(text.lower()) if t not in _STOP and len(t) > 1]
+    return [stem(t) for t in _TOKEN.findall(text.lower()) if t not in _STOP and len(t) > 1]
 
 
 def bm25_scores(query: str, documents: list[str], k1: float = 1.5, b: float = 0.75) -> list[float]:

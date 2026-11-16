@@ -9,6 +9,7 @@ from typing import Any
 
 from ..core.models import Task, ToolCall
 from .base import Workflow, call, last_result
+from .research import research_policy
 
 HOT_WORDS = ("urgent", "asap", "this week", "budget", "ready to", "contract", "demo")
 COLD_WORDS = ("student", "homework", "just browsing", "job", "internship", "unsubscribe")
@@ -47,6 +48,18 @@ def _plan(task: Task, _analysis: dict[str, Any]) -> list[dict[str, Any]]:
             "inputs": {"query": f"{task.inputs.get('company', '')} {task.inputs.get('name', '')}".strip()},
         },
         {
+            "agent": "research",
+            "action": "research_policy",
+            "description": "Retrieve the sales playbook's meeting length for introductory meetings.",
+            "inputs": {
+                "question": "sales playbook introductory meeting length minutes",
+                "doc_types": ["playbook"],
+                "fallback_query": "meetings business days",
+                "optional": True,
+                "extract": {"meeting_minutes": r"meetings are (\d+) minutes"},
+            },
+        },
+        {
             "agent": "sales_ops",
             "action": "qualify_lead",
             "description": "Look the lead up in the CRM, score it, and store the result.",
@@ -64,8 +77,8 @@ def _plan(task: Task, _analysis: dict[str, Any]) -> list[dict[str, Any]]:
             "agent": "scheduling",
             "action": "propose_slots",
             "description": "Offer meeting slots if the lead is hot or warm.",
-            "inputs": {"tier": "$steps.qualify_lead.tier"},
-            "depends_on": ["qualify_lead"],
+            "inputs": {"tier": "$steps.qualify_lead.tier", "duration": "$steps.research_policy.facts.meeting_minutes"},
+            "depends_on": ["qualify_lead", "research_policy"],
         },
     ]
 
@@ -189,7 +202,9 @@ def _slots(envelope: dict[str, Any], results: list[dict[str, Any]]) -> list[Tool
         return {"ok": True, "summary": "Cold lead; no meeting offered.", "data": {"slots": [], "offered": False}}
     found = last_result(results, "calendar_find_slots")
     if found is None:
-        return [call("calendar_find_slots", days_ahead=7, duration_minutes=30)]
+        return [
+            call("calendar_find_slots", days_ahead=7, duration_minutes=int(envelope["inputs"].get("duration") or 30))
+        ]
     if "error" in found:
         return {
             "ok": False,
@@ -238,6 +253,7 @@ def lead_intake_workflow() -> Workflow:
         replan=_replan,
         scripts={
             "recall_context": _recall,
+            "research_policy": research_policy,
             "qualify_lead": _qualify,
             "draft_reply": _draft,
             "propose_slots": _slots,
