@@ -91,6 +91,15 @@ def create_app(rt: Runtime, *, run_worker: bool = True) -> FastAPI:
         host = request.client.host if request.client else ""
         if host not in LOOPBACK_HOSTS:
             raise HTTPException(403, "dashboard access from other machines requires BIZOPS_API_KEY")
+        # Loopback-only access is still reachable by a web page open in the same browser. Two checks
+        # close that door: the Host header must name this machine (defeats DNS rebinding), and a
+        # state-changing request must come from the dashboard's own origin (defeats cross-site requests).
+        served_host = request.headers.get("host", "")
+        if served_host.rsplit(":", 1)[0].strip("[]") not in LOOPBACK_HOSTS | {"testserver"}:
+            raise HTTPException(403, "unexpected Host header for local-only access")
+        origin = request.headers.get("origin")
+        if request.method not in ("GET", "HEAD", "OPTIONS") and origin and origin.split("://", 1)[-1] != served_host:
+            raise HTTPException(403, "cross-origin requests are not accepted")
 
     app.include_router(build_dashboard_router(rt, dashboard_access, background))
 

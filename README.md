@@ -26,6 +26,7 @@ A multi-agent platform that takes a business task, plans it, delegates steps to 
 | Observability | Span tracing of runs, steps, model calls, and tool calls; structured logs; token and cost accounting |
 | Human approval hook | The gateway can suspend a run before a tool call and continue after approval (policy engine arrives in pull request 3) |
 | Tenancy | Every stored row and query is scoped to a tenant; the MCP client injects the tenant so a model cannot choose it |
+| Dashboard | Web console backed by the live API: overview, workflows, execution history, agents, MCP and tools, knowledge, memory, settings; light and dark themes; responsive; read-only demo mode for static hosting |
 
 ## Architecture
 
@@ -54,6 +55,16 @@ A run moves through fixed stages. The orchestrator owns control flow; agents own
 4. **Recover**: retry transient failures, replan around permanent ones.
 5. **Verify** that each step produced the outputs its playbook requires.
 6. **Report** and write what was learned to long-term memory.
+
+## Dashboard
+
+A web console is served by the backend:
+
+```bash
+.venv/bin/bizops serve
+```
+
+Open http://127.0.0.1:8000. It shows live data from the runtime and can start workflows, enable or disable agents, search and ingest knowledge, and inspect every run's steps, tool calls, trace, and report. The same static files run on GitHub Pages in a read-only demo mode that replays a recorded snapshot and is labelled as sample data. Details, the technology choice, and the security model are in [docs/DASHBOARD.md](docs/DASHBOARD.md).
 
 ## MCP architecture
 
@@ -166,7 +177,7 @@ Copy `.env.example` to `.env`. All settings and the hosted-model option are desc
 .venv/bin/pytest
 ```
 
-The suite runs offline in a few seconds. It covers storage, memory, the tool gateway, planning, end-to-end orchestration (retry, replanning, pause and resume, restart recovery, approval suspension, idempotency, tenant isolation), the MCP server in-process and over stdio, mock integrations, the HTTP integration framework, ingestion and hybrid retrieval, agentic retrieval, the job queue, and the webhook API.
+The suite runs offline in a few seconds. It covers storage, memory, the tool gateway, planning, end-to-end orchestration (retry, replanning, pause and resume, restart recovery, approval suspension, idempotency, tenant isolation), the MCP server in-process and over stdio, mock integrations, the HTTP integration framework, ingestion and hybrid retrieval, agentic retrieval, the job queue, the webhook API, and the dashboard API, access control, and static assets.
 
 ## Demo data and safety
 
@@ -187,6 +198,7 @@ At this stage, high-risk tools such as sending reminders run without human appro
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Setup guide](docs/SETUP.md)
+- [Dashboard](docs/DASHBOARD.md)
 - [Connecting real integrations](REAL-INTEGRATIONS-SETUP.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)

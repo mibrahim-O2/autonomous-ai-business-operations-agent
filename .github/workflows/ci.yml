@@ -23,6 +23,8 @@ jobs:
       - name: Install
         run: pip install -e ".[dev]"
       - name: Lint
-        run: ruff check src tests
+        run: ruff check src tests scripts
+      - name: Check dashboard JavaScript syntax
+        run: for f in $(find dashboard/assets/js -name '*.js'); do node --check "$f"; done
       - name: Test
         run: pytest
