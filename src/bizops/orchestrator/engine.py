@@ -175,6 +175,30 @@ class Orchestrator:
             return state
         return await self._drive(tenant_id, run_id, resumed=True)
 
+    async def resume_settled_approvals(self) -> list[str]:
+        """Continue runs that wait on an approval request that is no longer pending.
+
+        A request is settled when someone decided it without resuming the run (for example from another
+        process), or when it expired. Without this sweep an expired request would leave its run waiting
+        until someone pressed Resume. Returns the run ids continued.
+        """
+        if self.approvals is None:
+            return []
+        continued = []
+        rows = self.db.query("SELECT tenant_id, run_id FROM runs WHERE status='waiting_approval' ORDER BY updated_at")
+        for row in rows:
+            tenant_id, run_id = row["tenant_id"], row["run_id"]
+            state = self.db.load_run(tenant_id, run_id)
+            if self.approvals.is_pending(tenant_id, state.pending_approval_id):  # also expires overdue requests
+                continue
+            record = self.approvals.get(tenant_id, state.pending_approval_id) if state.pending_approval_id else None
+            self.tracer.event(
+                tenant_id, run_id, "run.approval_settled", status=record["status"] if record else "missing"
+            )
+            await self.resume(tenant_id, run_id)
+            continued.append(run_id)
+        return continued
+
     async def recover_interrupted(self) -> list[str]:
         """Resume runs whose worker died or stalled (marked running, lease gone). Returns the run ids taken up.
 

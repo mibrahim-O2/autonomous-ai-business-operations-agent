@@ -14,6 +14,7 @@ bizops audit [--verify]                show the audit log or verify its hash cha
 bizops keys create NAME --role ROLE    create a tenant- and role-bound API key (shown once)
 bizops keys list | keys revoke ID
 bizops recover                         resume runs whose worker died
+bizops eval [--case ID] [--json]       run the evaluation suite with the configured model
 bizops worker --once                   process queued jobs
 bizops serve                           start the HTTP API and worker
 """
@@ -218,6 +219,40 @@ async def _dispatch(args: argparse.Namespace, rt: Runtime) -> int:
                     f"{key['key_id']}  {key['role']:<9} {state_text:<8} {key['name']}  "
                     f"last used {key['last_used_at'] or 'never'}"
                 )
+    elif command == "eval":
+        from .evaluation import EvaluationStore
+        from .evaluation.runner import evaluate_and_store
+
+        store = EvaluationStore(rt.db)
+        if rt.llm.name != "scripted":
+            print(f"Evaluating with the live model {rt.llm.name} {rt.llm.model}. This makes billed API calls.")
+        eval_id = await evaluate_and_store(
+            store, rt.settings, tenant, rt.llm.name, rt.llm.model, _operator(args, tenant).name, args.case or None
+        )
+        report = store.get(tenant, eval_id)
+        assert report is not None
+        if args.json:
+            print(json.dumps(report, indent=2, default=str))
+        for case in report["cases"]:
+            mark = "PASS" if case["passed"] else "FAIL"
+            print(
+                f"{mark}  {case['case_id']:<24} {case['category']:<13} {case['metrics']['latency_ms']:>8.1f} ms  "
+                f"{case['title']}"
+            )
+            for check in case["checks"]:
+                if not check["passed"]:
+                    print(f"        failed: {check['name']}: {check['detail']}")
+        summary, retrieval = report["summary"], report["summary"]["retrieval"]
+        print(
+            f"\n{summary['passed']}/{summary['cases']} cases passed ({summary['checks_passed']}/{summary['checks']} "
+            f"checks); p95 latency {summary['latency_ms']['p95']} ms; {summary['model_calls']} model calls; "
+            f"cost {summary['cost_usd']} USD"
+        )
+        print(
+            f"Retrieval: hit@1 {retrieval['hit_at_1']}, recall@3 {retrieval['recall_at_3']}, MRR {retrieval['mrr']}, "
+            f"untrusted filter {'ok' if retrieval['untrusted_filter_ok'] else 'LEAKED'}  (stored as {eval_id})"
+        )
+        return 0 if summary["passed"] == summary["cases"] else 1
     elif command == "recover":
         recovered = await rt.orchestrator.recover_interrupted()
         print(f"Recovered {len(recovered)} interrupted run(s): {', '.join(recovered) or 'none'}")
@@ -295,6 +330,9 @@ def build_parser() -> argparse.ArgumentParser:
     revoke = keys_sub.add_parser("revoke")
     revoke.add_argument("key_id")
     sub.add_parser("recover", help="resume runs whose worker died")
+    evaluate = sub.add_parser("eval", help="run the evaluation suite with the configured model")
+    evaluate.add_argument("--case", action="append", default=[], help="run only this case (repeatable)")
+    evaluate.add_argument("--json", action="store_true")
     worker = sub.add_parser("worker", help="process queued jobs")
     worker.add_argument("--once", action="store_true", help="drain due jobs and exit")
     serve = sub.add_parser("serve", help="start the HTTP API and worker")

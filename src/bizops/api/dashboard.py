@@ -11,6 +11,7 @@ application share one contract.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections import Counter
 from typing import Any
 
@@ -22,6 +23,7 @@ from ..approvals import DEFAULT_POLICY, ApprovalPolicy, load_policy, save_policy
 from ..core.errors import Conflict, PermissionDenied, RunNotFound
 from ..core.models import TERMINAL_RUN_STATES, RunState, RunStatus, Task
 from ..demo import SCENARIOS
+from ..evaluation import CASES, EvaluationStore
 from ..integrations.mock import MockBilling, MockCalendar, MockCRM, MockEmail
 from ..llm.scripted import ScriptedLLM
 from ..runtime import Runtime
@@ -67,6 +69,10 @@ class Decision(BaseModel):
 class NewKey(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     role: Role
+
+
+class EvaluationRequest(BaseModel):
+    cases: list[str] = Field(default_factory=list, max_length=50)
 
 
 class SearchRequest(BaseModel):
@@ -842,5 +848,241 @@ def build_dashboard_router(rt: Runtime, require: Any, background: set[asyncio.Ta
                 "model_retry_stats": getattr(rt.llm, "stats", None),
             },
         }
+
+    # Observability -------------------------------------------------------------
+    def pct(values: list[float], p: float) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        return round(ordered[min(len(ordered) - 1, max(0, round(p / 100 * (len(ordered) - 1))))], 1)
+
+    def latency(values: list[float]) -> dict[str, Any]:
+        return {
+            "count": len(values),
+            "p50": pct(values, 50),
+            "p95": pct(values, 95),
+            "max": round(max(values), 1) if values else None,
+            "mean": round(sum(values) / len(values), 1) if values else None,
+        }
+
+    @router.get("/observability")
+    async def observability(principal: Principal = can_read) -> dict[str, Any]:
+        """Latency, usage, cost, tool reliability, and workflow outcomes, computed from the stored trace."""
+        tenant_id = principal.tenant_id
+        spans = rt.db.query(
+            "SELECT kind, duration_ms, payload_json FROM events WHERE tenant_id=? AND duration_ms IS NOT NULL "
+            "ORDER BY event_id DESC LIMIT 20000",
+            (tenant_id,),
+        )
+        by_kind: dict[str, list[float]] = {}
+        tools: dict[str, dict[str, Any]] = {}
+        agents: dict[str, dict[str, Any]] = {}
+        models: dict[str, dict[str, Any]] = {}
+        for row in spans:
+            by_kind.setdefault(row["kind"], []).append(row["duration_ms"])
+            payload = json.loads(row["payload_json"])
+            if row["kind"] == "tool.call":
+                entry = tools.setdefault(
+                    payload.get("tool", "?"), {"calls": 0, "errors": 0, "durations": [], "risk": payload.get("risk")}
+                )
+                entry["calls"] += 1
+                entry["errors"] += 0 if payload.get("ok") else 1
+                entry["durations"].append(row["duration_ms"])
+            elif row["kind"] == "llm.call":
+                for key, table in (
+                    (payload.get("agent", "planner"), agents),
+                    (payload.get("model") or "unknown", models),
+                ):
+                    entry = table.setdefault(key, {"calls": 0, "input_tokens": 0, "output_tokens": 0, "durations": []})
+                    entry["calls"] += 1
+                    entry["input_tokens"] += int(payload.get("input_tokens") or 0)
+                    entry["output_tokens"] += int(payload.get("output_tokens") or 0)
+                    entry["durations"].append(row["duration_ms"])
+
+        def finish(table: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+            out = []
+            for name, entry in table.items():
+                durations = entry.pop("durations")
+                out.append({"name": name, **entry, "latency": latency(durations)})
+            return sorted(out, key=lambda e: -e["calls"])
+
+        runs = rt.db.load_runs(tenant_id, 1000)
+        workflows: dict[str, dict[str, Any]] = {}
+        for run in runs:
+            name = run.analysis.get("workflow") or run.task.workflow or "unclassified"
+            entry = workflows.setdefault(
+                name,
+                {
+                    "runs": 0,
+                    "statuses": Counter(),
+                    "cost_usd": 0.0,
+                    "model_calls": 0,
+                    "tokens": 0,
+                    "durations": [],
+                    "replans": 0,
+                },
+            )
+            entry["runs"] += 1
+            entry["statuses"][run.status.value] += 1
+            entry["cost_usd"] += run.usage.cost_usd
+            entry["model_calls"] += run.usage.calls
+            entry["tokens"] += run.usage.input_tokens + run.usage.output_tokens
+            entry["replans"] += run.replans
+            if run.status in TERMINAL_RUN_STATES:
+                entry["durations"].append((run.updated_at - run.created_at).total_seconds() * 1000)
+        workflow_rows = []
+        for name, entry in sorted(workflows.items(), key=lambda kv: -kv[1]["runs"]):
+            statuses = dict(entry["statuses"])
+            finished = statuses.get("completed", 0) + statuses.get("failed", 0)
+            workflow_rows.append(
+                {
+                    "workflow": name,
+                    "runs": entry["runs"],
+                    "statuses": statuses,
+                    "success_rate": round(statuses.get("completed", 0) / finished, 3) if finished else None,
+                    "replans": entry["replans"],
+                    "cost_usd": round(entry["cost_usd"], 6),
+                    "model_calls": entry["model_calls"],
+                    "tokens": entry["tokens"],
+                    "duration": latency(entry["durations"]),
+                }
+            )
+        days: dict[str, Counter[str]] = {}
+        for run in runs:
+            days.setdefault(run.created_at.date().isoformat(), Counter())[run.status.value] += 1
+        problems = rt.db.recent_events(
+            tenant_id,
+            [
+                "run.failed",
+                "tool.rejected",
+                "step.timed_out",
+                "step.retry_scheduled",
+                "plan.replanned",
+                "security.injection_suspected",
+                "tool.intent_unresolved",
+                "run.stale_worker_stopped",
+                "run.recovery_started",
+            ],
+            40,
+        )
+        tool_rows = finish(tools)
+        for row in tool_rows:
+            row["error_rate"] = round(row["errors"] / row["calls"], 3) if row["calls"] else 0.0
+        llm_spans = by_kind.get("llm.call", [])
+        return {
+            "latency": {kind: latency(values) for kind, values in sorted(by_kind.items())},
+            "usage": {
+                "model_calls": len(llm_spans),
+                "input_tokens": sum(a["input_tokens"] for a in agents.values()),
+                "output_tokens": sum(a["output_tokens"] for a in agents.values()),
+                "cost_usd": round(sum(r.usage.cost_usd for r in runs), 6),
+                "by_agent": finish(agents),
+                "by_model": finish(models),
+            },
+            "tools": tool_rows,
+            "workflows": workflow_rows,
+            "daily": [{"date": day, **dict(counts)} for day, counts in sorted(days.items())[-14:]],
+            "problems": [
+                {
+                    "ts": e["ts"],
+                    "kind": e["kind"],
+                    "run_id": e["run_id"],
+                    **{k: v for k, v in e["payload"].items() if not isinstance(v, dict | list)},
+                }
+                for e in problems
+            ],
+            "events_recorded": rt.db.query("SELECT COUNT(*) AS n FROM events WHERE tenant_id=?", (tenant_id,))[0]["n"],
+        }
+
+    @router.get("/events")
+    async def event_log(
+        kind: str | None = None,
+        run_id: str | None = None,
+        q: str | None = None,
+        before: int | None = None,
+        limit: int = 100,
+        principal: Principal = can_read,
+    ) -> dict[str, Any]:
+        """The raw trace as a searchable log, newest first, paged by event id."""
+        sql, params = "SELECT * FROM events WHERE tenant_id=?", [principal.tenant_id]
+        if kind:
+            sql += " AND kind LIKE ? ESCAPE '\\'"
+            params.append(kind.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%")
+        if run_id:
+            sql += " AND run_id=?"
+            params.append(run_id)
+        if q:
+            sql += " AND payload_json LIKE ?"
+            params.append(f"%{q[:100]}%")
+        if before:
+            sql += " AND event_id<?"
+            params.append(before)
+        rows = rt.db.query(sql + " ORDER BY event_id DESC LIMIT ?", (*params, max(1, min(limit, 500))))
+        items = [
+            {
+                "event_id": r["event_id"],
+                "ts": r["ts"],
+                "kind": r["kind"],
+                "run_id": r["run_id"],
+                "duration_ms": r["duration_ms"],
+                "payload": json.loads(r["payload_json"]),
+            }
+            for r in rows
+        ]
+        kinds = [
+            r["kind"]
+            for r in rt.db.query(
+                "SELECT DISTINCT kind FROM events WHERE tenant_id=? ORDER BY kind", (principal.tenant_id,)
+            )
+        ]
+        return {
+            "items": items,
+            "next_before": items[-1]["event_id"] if len(items) == max(1, min(limit, 500)) else None,
+            "kinds": kinds,
+        }
+
+    # Evaluation -----------------------------------------------------------------
+    evaluations = EvaluationStore(rt.db)
+
+    @router.get("/evaluations")
+    async def list_evaluations(principal: Principal = can_read) -> dict[str, Any]:
+        return {
+            "cases": [
+                {"case_id": c.case_id, "title": c.title, "category": c.category, "description": c.description}
+                for c in CASES
+            ],
+            "runs": evaluations.list(principal.tenant_id),
+            "model": {"provider": rt.llm.name, "model": rt.llm.model, "live_model": live_model()},
+        }
+
+    @router.get("/evaluations/{eval_id}")
+    async def get_evaluation(eval_id: str, principal: Principal = can_read) -> dict[str, Any]:
+        report = evaluations.get(principal.tenant_id, eval_id)
+        if report is None:
+            raise HTTPException(404, "evaluation not found")
+        return report
+
+    @router.post("/evaluations/run", status_code=202)
+    async def start_evaluation(body: EvaluationRequest, principal: Principal = can_run_start) -> dict[str, Any]:
+        """Run the suite in the background, each case on its own temporary database."""
+        if any(r["status"] == "running" for r in evaluations.list(principal.tenant_id, 5)):
+            raise HTTPException(409, "an evaluation is already running")
+        known = {c.case_id for c in CASES}
+        if unknown := sorted(set(body.cases) - known):
+            raise HTTPException(422, f"unknown case(s): {unknown}")
+        eval_id = evaluations.start(principal.tenant_id, rt.llm.name, rt.llm.model, principal.name)
+
+        async def go() -> None:
+            from ..evaluation.runner import run_evaluation
+
+            try:
+                results, retrieval, summary = await run_evaluation(rt.settings, body.cases or None)
+                evaluations.finish(eval_id, results, retrieval, summary)
+            except Exception as exc:  # recorded on the evaluation; the server keeps running
+                evaluations.fail(eval_id, f"{type(exc).__name__}: {exc}")
+
+        audit(principal, "evaluation.started", eval_id, cases=body.cases or "all", model=rt.llm.model)
+        in_background(go())
+        return {"eval_id": eval_id, "status": "running"}
 
     return router

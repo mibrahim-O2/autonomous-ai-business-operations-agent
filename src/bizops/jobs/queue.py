@@ -158,7 +158,16 @@ class Worker:
             outcomes.append(outcome)
         return outcomes
 
-    async def run_forever(self, poll_seconds: float = 1.0) -> None:
+    async def run_forever(self, poll_seconds: float = 1.0, sweep_every_seconds: float = 30.0) -> None:
+        """Process jobs; periodically continue runs whose approval request was decided or expired elsewhere."""
+        last_sweep = 0.0
+        loop = asyncio.get_running_loop()
         while True:
+            if loop.time() - last_sweep >= sweep_every_seconds:
+                last_sweep = loop.time()
+                try:
+                    await self.orchestrator.resume_settled_approvals()
+                except Exception:  # a sweep fault must not stop job processing
+                    log.exception("approval sweep failed")
             if await self.run_once() is None:
                 await asyncio.sleep(poll_seconds)

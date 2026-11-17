@@ -192,6 +192,22 @@ MIGRATIONS: list[str] = [
     );
     CREATE INDEX idx_audit_tenant ON audit_log(tenant_id, seq);
     """,
+    # 5: evaluation results
+    """
+    CREATE TABLE evaluations (
+        eval_id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        triggered_by TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        summary_json TEXT NOT NULL DEFAULT '{}',
+        results_json TEXT NOT NULL DEFAULT '[]'
+    );
+    CREATE INDEX idx_evaluations_tenant ON evaluations(tenant_id, started_at);
+    """,
 ]
 
 
