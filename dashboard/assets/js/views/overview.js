@@ -1,4 +1,4 @@
-import { donut, PALETTE, stackedBars } from "../charts.js";
+import { colorFor, donut, PALETTE, stackedBars } from "../charts.js";
 import { card, fmt, h, kpi, statusBadge, table } from "../ui.js";
 
 const TONE = { "run.completed": "ok", "run.failed": "bad", "run.waiting_approval": "warn", "run.paused": "warn", "plan.replanned": "warn" };
@@ -8,7 +8,7 @@ export const title = "Overview";
 export async function render({ api, navigate }) {
   const data = await api.overview();
   const t = data.totals;
-  const statusSegments = Object.entries(data.by_status).map(([label, value]) => ({ label: fmt.title(label), value, color: PALETTE[label] || "#64748b" }));
+  const statusSegments = Object.entries(data.by_status).map(([label, value]) => ({ label: fmt.title(label), value, color: colorFor(label) }));
   const workflowRows = data.by_workflow.map((w) => ({ label: w.workflow, parts: Object.keys(PALETTE).map((key) => ({ key, value: w[key] || 0, color: PALETTE[key] })) }));
   const usage = data.usage;
 

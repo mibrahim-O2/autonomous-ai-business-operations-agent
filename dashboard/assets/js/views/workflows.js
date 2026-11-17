@@ -1,4 +1,4 @@
-import { badge, card, chip, h, statusBadge, toast } from "../ui.js";
+import { badge, card, chip, fmt, h, statusBadge, toast } from "../ui.js";
 
 export const title = "Workflows";
 
@@ -17,7 +17,7 @@ export async function render({ api, isDemo, navigate }) {
           } catch (error) { toast(error.message, "bad"); event.target.disabled = false; }
         } });
       const counts = Object.entries(w.runs);
-      return card(w.name.replaceAll("_", " "), h("div", { class: "stack" },
+      return card(fmt.title(w.name), h("div", { class: "stack" },
         h("p", { text: w.description }),
         h("div", { class: "row" }, badge(`version ${w.version}`, "primary plain"), badge(w.has_recovery_plan ? "has recovery plan" : "no recovery plan", w.has_recovery_plan ? "ok plain" : "plain"),
           counts.length ? counts.map(([status, n]) => h("span", { class: "row" }, statusBadge(status), h("span", { class: "small muted", text: `x${n}` }))) : badge("no runs yet", "plain")),

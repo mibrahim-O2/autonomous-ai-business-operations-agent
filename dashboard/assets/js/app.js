@@ -4,7 +4,9 @@ import { errorState, h, loadingState, toast } from "./ui.js";
 import * as agents from "./views/agents.js";
 import * as approvals from "./views/approvals.js";
 import * as knowledge from "./views/knowledge.js";
+import * as evaluation from "./views/evaluation.js";
 import * as memory from "./views/memory.js";
+import * as observability from "./views/observability.js";
 import * as overview from "./views/overview.js";
 import * as runs from "./views/runs.js";
 import * as security from "./views/security.js";
@@ -22,6 +24,8 @@ const ICON = {
   memory: "M7 7h10v10H7zM4 10h3m-3 4h3m10-4h3m-3 4h3M10 4v3m4-3v3m-4 10v3m4-3v3",
   approvals: "M9 12l2 2 4-4m5 2a8 8 0 1 1-16 0 8 8 0 0 1 16 0z",
   security: "M12 3l7 3v5c0 4.5-3 8.3-7 10-4-1.7-7-5.5-7-10V6z",
+  observability: "M3 12h4l3-7 4 14 3-7h4",
+  evaluation: "M9 11l2 2 4-4M7 4h10a2 2 0 0 1 2 2v14l-3-2-2 2-2-2-2 2-2-2-3 2V6a2 2 0 0 1 2-2z",
   settings: "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm7-3 2 1-2 4-2-1-2 1-1 2H10l-1-2-2-1-2 1-2-4 2-1v-2L3 9l2-4 2 1 2-1 1-2h4l1 2 2 1 2-1 2 4-2 1z",
 };
 const ROUTES = [
@@ -35,6 +39,9 @@ const ROUTES = [
   { id: "tools", label: "MCP and tools", view: tools },
   { id: "knowledge", label: "Knowledge", view: knowledge },
   { id: "memory", label: "Memory", view: memory },
+  { group: "Insight" },
+  { id: "observability", label: "Observability", view: observability },
+  { id: "evaluation", label: "Evaluation", view: evaluation },
   { group: "Administration" },
   { id: "security", label: "Security and reliability", view: security },
   { id: "settings", label: "Settings", view: settings },

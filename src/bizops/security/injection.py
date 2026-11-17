@@ -68,8 +68,16 @@ def scan_for_injection(value: Any) -> list[dict[str, str]]:
             match = pattern.search(text)
             if match and name not in seen:
                 seen.add(name)
+                # Start and end the excerpt on word boundaries so it reads as text, not a fragment.
                 start = max(0, match.start() - 20)
-                findings.append({"pattern": name, "excerpt": text[start : match.end() + 40].strip()[:160]})
+                if start:
+                    space = text.find(" ", start)
+                    start = space + 1 if 0 <= space < match.start() else match.start()
+                end = min(len(text), match.end() + 40)
+                if end < len(text):
+                    space = text.rfind(" ", match.end(), end)
+                    end = space if space > match.end() else end
+                findings.append({"pattern": name, "excerpt": text[start:end].strip()[:160]})
     return findings
 
 

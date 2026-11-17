@@ -25,6 +25,8 @@ from bizops.api import create_app
 from bizops.core.config import Settings
 from bizops.core.models import Task
 from bizops.demo import SCENARIOS
+from bizops.evaluation import EvaluationStore
+from bizops.evaluation.runner import evaluate_and_store
 from bizops.runtime import build_runtime
 from bizops.security import Principal, Role
 
@@ -111,6 +113,10 @@ def main() -> None:
         rt = build_runtime(Settings(_env_file=None, data_dir=Path(tmp), log_level="WARNING"))
         asyncio.run(rt.start())
         asyncio.run(run_scenarios(rt))
+        # A recorded evaluation of the offline model, stored exactly as `bizops eval` stores it.
+        asyncio.run(
+            evaluate_and_store(EvaluationStore(rt.db), rt.settings, "demo", rt.llm.name, rt.llm.model, "demo-recording")
+        )
         logging.disable(logging.INFO)  # keep the recording quiet
         with TestClient(create_app(rt, run_worker=False), client=("127.0.0.1", 50000)) as client:
             get = lambda path: client.get(f"/api{path}").json()  # noqa: E731
@@ -141,6 +147,12 @@ def main() -> None:
                 "audit": get("/audit"),
                 "audit_verify": get("/audit/verify"),
                 "security": get("/security"),
+                "observability": get("/observability"),
+                "events": get("/events?limit=500"),
+                "evaluations": get("/evaluations"),
+            }
+            snapshot["evaluation_details"] = {
+                r["eval_id"]: get(f"/evaluations/{r['eval_id']}") for r in snapshot["evaluations"]["runs"]
             }
         rt.close()
     OUT.parent.mkdir(parents=True, exist_ok=True)

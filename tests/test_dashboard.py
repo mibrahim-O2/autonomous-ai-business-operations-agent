@@ -295,3 +295,25 @@ def test_demo_snapshot_has_the_data_the_new_screens_read_and_nothing_secret():
     for method in ("decide()", "pauseRun()", "resumeRun()", "cancelRun()", "savePolicy()", "createKey()"):
         assert f"{method} {{ return Promise.reject(new DemoModeError(" in demo, method
     assert "a.can_decide = false" in demo
+
+
+def test_palette_has_no_blue_or_purple_and_fonts_are_licensed():
+    """The design system uses emerald, teal, charcoal, and warm white. Blue and purple are not allowed."""
+    import colorsys
+
+    sources = [DASHBOARD / "assets" / "styles.css", DASHBOARD / "index.html", DASHBOARD / "assets" / "favicon.svg"]
+    sources += list((DASHBOARD / "assets" / "js").rglob("*.js"))
+    offenders = []
+    for path in sources:
+        for value in re.findall(r"#([0-9a-fA-F]{6})\b", path.read_text()):
+            r, g, b = (int(value[i : i + 2], 16) / 255 for i in (0, 2, 4))
+            hue, lightness, saturation = colorsys.rgb_to_hls(r, g, b)
+            # Blue through purple is roughly 195 to 300 degrees; ignore near-greys.
+            if saturation > 0.2 and 0.05 < lightness < 0.97 and 195 <= hue * 360 <= 300:
+                offenders.append(f"{path.name}: #{value}")
+    assert offenders == []
+    fonts = DASHBOARD / "assets" / "fonts"
+    for family in ("manrope", "fraunces", "jetbrains-mono"):
+        assert (fonts / f"{family}-latin-wght.woff2").stat().st_size > 10_000
+    assert len(list(fonts.glob("LICENSE-*.txt"))) == 3
+    assert all("SIL Open Font License" in p.read_text() for p in fonts.glob("LICENSE-*.txt"))

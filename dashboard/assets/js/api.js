@@ -82,6 +82,14 @@ class LiveBackend {
   keys() { return this.request("GET", "/keys"); }
   createKey(name, role) { return this.request("POST", "/keys", { name, role }); }
   revokeKey(id) { return this.request("DELETE", `/keys/${encodeURIComponent(id)}`); }
+  observability() { return this.request("GET", "/observability"); }
+  events(filters = {}) {
+    const query = new URLSearchParams(Object.entries(filters).filter(([, v]) => v !== undefined && v !== null && v !== ""));
+    return this.request("GET", `/events${query.size ? `?${query}` : ""}`);
+  }
+  evaluations() { return this.request("GET", "/evaluations"); }
+  evaluation(id) { return this.request("GET", `/evaluations/${encodeURIComponent(id)}`); }
+  runEvaluation(cases = []) { return this.request("POST", "/evaluations/run", { cases }); }
 }
 
 class DemoBackend {
@@ -150,6 +158,25 @@ class DemoBackend {
   keys() { return Promise.resolve([]); }
   createKey() { return Promise.reject(new DemoModeError("Creating an API key")); }
   revokeKey() { return Promise.reject(new DemoModeError("Revoking an API key")); }
+  observability() { return this.pick("observability"); }
+  async events(filters = {}) {
+    const all = await this.pick("events");
+    const q = (filters.q || "").toLowerCase();
+    const items = all.items.filter((e) => (!filters.kind || e.kind.startsWith(filters.kind))
+      && (!filters.run_id || e.run_id === filters.run_id)
+      && (!q || JSON.stringify(e.payload).toLowerCase().includes(q))
+      && (!filters.before || e.event_id < filters.before));
+    const limit = filters.limit || 100;
+    const page = items.slice(0, limit);
+    return { items: page, kinds: all.kinds, next_before: items.length > limit ? page[page.length - 1].event_id : null };
+  }
+  evaluations() { return this.pick("evaluations"); }
+  async evaluation(id) {
+    const report = (await this.load()).evaluation_details[id];
+    if (!report) throw new ApiError("This evaluation is not part of the demo snapshot.", 404);
+    return structuredClone(report);
+  }
+  runEvaluation() { return Promise.reject(new DemoModeError("Running the evaluation suite")); }
 }
 
 export function createBackend(config) {

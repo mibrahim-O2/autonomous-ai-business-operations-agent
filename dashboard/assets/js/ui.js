@@ -66,7 +66,10 @@ export function errorState(error, retry) {
 
 export function toast(message, tone = "info", ms = 5000) {
   const el = h("div", { class: `toast ${tone}`, text: message });
-  document.getElementById("toasts").append(el);
+  const stack = document.getElementById("toasts");
+  stack.append(el);
+  // Keep only the newest three on screen.
+  while (stack.children.length > 3) stack.firstElementChild.remove();
   setTimeout(() => el.remove(), ms);
 }
 
@@ -101,8 +104,8 @@ export const kv = (pairs) => h("dl", { class: "kv" }, pairs.filter(Boolean).map(
 export const fmt = {
   int: (n) => (n ?? 0).toLocaleString("en-US"),
   pct: (x) => (x === null || x === undefined ? "n/a" : `${(x * 100).toFixed(x === 1 || x === 0 ? 0 : 1)}%`),
-  usd: (x) => `$${(x ?? 0).toFixed((x ?? 0) < 1 ? 4 : 2)}`,
-  ms: (x) => (x === null || x === undefined ? "-" : x < 1000 ? `${Math.round(x)} ms` : `${(x / 1000).toFixed(2)} s`),
+  usd: (x) => (!x ? "$0.00" : `$${x.toFixed(x < 0.01 ? 4 : 2)}`),
+  ms: (x) => (x === null || x === undefined ? "-" : x < 1 ? "< 1 ms" : x < 1000 ? `${Math.round(x)} ms` : `${(x / 1000).toFixed(2)} s`),
   time: (iso) => (iso ? new Date(iso).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "-"),
   clock: (iso) => (iso ? new Date(iso).toLocaleTimeString(undefined, { hour12: false }) : "-"),
   title: (s) => String(s || "").replaceAll("_", " ").replace(/^./, (c) => c.toUpperCase()),
