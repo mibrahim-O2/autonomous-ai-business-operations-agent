@@ -2,10 +2,12 @@
 import { ApiError, createBackend } from "./api.js";
 import { errorState, h, loadingState, toast } from "./ui.js";
 import * as agents from "./views/agents.js";
+import * as approvals from "./views/approvals.js";
 import * as knowledge from "./views/knowledge.js";
 import * as memory from "./views/memory.js";
 import * as overview from "./views/overview.js";
 import * as runs from "./views/runs.js";
+import * as security from "./views/security.js";
 import * as settings from "./views/settings.js";
 import * as tools from "./views/tools.js";
 import * as workflows from "./views/workflows.js";
@@ -18,12 +20,15 @@ const ICON = {
   tools: "M14.5 6.5a4 4 0 0 0-5.2 5.2L4 17l3 3 5.3-5.3a4 4 0 0 0 5.2-5.2l-2.5 2.5-2.5-2.5z",
   knowledge: "M5 4h10a3 3 0 0 1 3 3v13H8a3 3 0 0 1-3-3zm0 13a3 3 0 0 1 3-3h10",
   memory: "M7 7h10v10H7zM4 10h3m-3 4h3m10-4h3m-3 4h3M10 4v3m4-3v3m-4 10v3m4-3v3",
+  approvals: "M9 12l2 2 4-4m5 2a8 8 0 1 1-16 0 8 8 0 0 1 16 0z",
+  security: "M12 3l7 3v5c0 4.5-3 8.3-7 10-4-1.7-7-5.5-7-10V6z",
   settings: "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm7-3 2 1-2 4-2-1-2 1-1 2H10l-1-2-2-1-2 1-2-4 2-1v-2L3 9l2-4 2 1 2-1 1-2h4l1 2 2 1 2-1 2 4-2 1z",
 };
 const ROUTES = [
   { group: "Operate" },
   { id: "overview", label: "Overview", view: overview },
   { id: "workflows", label: "Workflows", view: workflows },
+  { id: "approvals", label: "Approval Center", view: approvals },
   { id: "runs", label: "Execution history", view: runs },
   { group: "Platform" },
   { id: "agents", label: "Agents", view: agents },
@@ -31,6 +36,7 @@ const ROUTES = [
   { id: "knowledge", label: "Knowledge", view: knowledge },
   { id: "memory", label: "Memory", view: memory },
   { group: "Administration" },
+  { id: "security", label: "Security and reliability", view: security },
   { id: "settings", label: "Settings", view: settings },
 ];
 
@@ -48,7 +54,20 @@ function buildNav() {
     ? h("div", { class: "nav-group", text: route.group })
     : h("a", { href: `#/${route.id}`, "data-route": route.id },
       h("svg", { viewBox: "0 0 24 24", "aria-hidden": "true" }, h("path", { d: ICON[route.id], fill: "none", stroke: "currentColor", "stroke-width": "1.8", "stroke-linecap": "round", "stroke-linejoin": "round" })),
-      route.label)));
+      route.label, route.id === "approvals" ? h("span", { class: "nav-count", id: "approval-count", hidden: true }) : null)));
+}
+
+// The number of requests waiting for a person, shown next to the Approval Center link.
+async function updatePendingCount() {
+  const el = document.getElementById("approval-count");
+  if (!el) return;
+  try {
+    const { counts } = await api.approvals({ status: "pending" });
+    const pending = counts.pending || 0;
+    el.textContent = String(pending);
+    el.hidden = pending === 0;
+    el.setAttribute("aria-label", `${pending} waiting for a decision`);
+  } catch (_) { el.hidden = true; }
 }
 
 function setTheme(theme) {
@@ -68,7 +87,7 @@ function askForKey() {
     const input = h("input", { class: "input", type: "password", id: "access-key", autocomplete: "off", required: true });
     const dialog = h("dialog", { "aria-label": "Access key required" }, h("form", { method: "dialog", onSubmit: () => { api.setKey(input.value); } },
       h("div", { class: "dialog-body" }, h("h2", { class: "card-title", text: "Access key required" }),
-        h("p", { class: "muted", text: "This server is protected by BIZOPS_API_KEY. Enter the key to continue. It is kept in this tab's memory only and is cleared when you reload." }),
+        h("p", { class: "muted", text: "This server requires an API key. Each key belongs to one tenant and one role (viewer, operator, approver, or admin), which decides what you can do here. The key is kept in this tab's memory only and is cleared when you reload." }),
         h("div", { class: "field" }, h("label", { for: "access-key", text: "API key" }), input)),
       h("div", { class: "dialog-foot" }, h("button", { class: "btn primary", type: "submit", text: "Continue" }))));
     dialog.addEventListener("close", () => { dialog.remove(); resolve(); });
@@ -90,7 +109,8 @@ async function renderRoute() {
   document.title = `${route.view.title} - BizOps Agent Console`;
   main.replaceChildren(loadingState());
   closeMenu();
-  const ctx = { api, isDemo, param, navigate: (hash) => { location.hash = hash; }, refresh: renderRoute,
+  updatePendingCount();
+  const ctx = { api, isDemo, param, navigate: (hash) => { location.hash = hash; }, refresh: renderRoute, updatePendingCount,
     setTitle: (text) => { titleEl.textContent = text; }, onCleanup: (fn) => cleanup.push(fn) };
   try {
     const node = await route.view.render(ctx);
@@ -133,7 +153,9 @@ async function init() {
     if (!isDemo) {
       badgeEl.textContent = meta.llm.live_model ? `Live: ${meta.llm.provider} ${meta.llm.model}` : "Local: offline scripted model";
       badgeEl.className = `badge ${meta.llm.live_model ? "info" : "ok"}`;
-      foot.append(h("div", {}, "Tenant ", h("strong", { text: meta.tenant })), h("div", { text: `Version ${meta.version}` }));
+      foot.append(h("div", {}, "Tenant ", h("strong", { text: meta.tenant })),
+        meta.principal ? h("div", {}, "Signed in as ", h("strong", { text: meta.principal.name }), ` (${meta.principal.role})`) : null,
+        h("div", { text: `Version ${meta.version}` }));
     } else {
       foot.append(h("div", { text: `Snapshot of version ${meta.version}` }));
     }

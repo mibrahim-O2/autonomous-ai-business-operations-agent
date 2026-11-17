@@ -63,6 +63,25 @@ class LiveBackend {
   }
   deleteMemory(id) { return this.request("DELETE", `/memory/${encodeURIComponent(id)}`); }
   settings() { return this.request("GET", "/settings"); }
+  // Human-in-the-loop and run control. Each returns the record the backend stored, so the
+  // interface only ever reports a decision or a state change the server has confirmed.
+  approvals(filters = {}) {
+    const query = new URLSearchParams(Object.entries(filters).filter(([, v]) => v));
+    return this.request("GET", `/approvals${query.size ? `?${query}` : ""}`);
+  }
+  decide(id, decision) { return this.request("POST", `/approvals/${encodeURIComponent(id)}/decision`, decision); }
+  pauseRun(id) { return this.request("POST", `/runs/${encodeURIComponent(id)}/pause`); }
+  resumeRun(id) { return this.request("POST", `/runs/${encodeURIComponent(id)}/resume`); }
+  cancelRun(id) { return this.request("POST", `/runs/${encodeURIComponent(id)}/cancel`); }
+  policy() { return this.request("GET", "/policy"); }
+  savePolicy(policy) { return this.request("PUT", "/policy", policy); }
+  resetPolicy() { return this.request("POST", "/policy/reset"); }
+  audit(limit = 100) { return this.request("GET", `/audit?limit=${limit}`); }
+  verifyAudit() { return this.request("GET", "/audit/verify"); }
+  security() { return this.request("GET", "/security"); }
+  keys() { return this.request("GET", "/keys"); }
+  createKey(name, role) { return this.request("POST", "/keys", { name, role }); }
+  revokeKey(id) { return this.request("DELETE", `/keys/${encodeURIComponent(id)}`); }
 }
 
 class DemoBackend {
@@ -111,6 +130,26 @@ class DemoBackend {
   }
   deleteMemory() { return Promise.reject(new DemoModeError("Deleting a memory record")); }
   settings() { return this.pick("settings"); }
+  async approvals(filters = {}) {
+    const data = await this.pick("approvals");
+    data.items = data.items.filter((a) => (!filters.status || a.status === filters.status) && (!filters.run_id || a.run_id === filters.run_id));
+    // Nothing can be decided in the demo, whatever the recording says.
+    data.items.forEach((a) => { a.can_decide = false; });
+    return data;
+  }
+  decide() { return Promise.reject(new DemoModeError("Approving or rejecting an action")); }
+  pauseRun() { return Promise.reject(new DemoModeError("Pausing a run")); }
+  resumeRun() { return Promise.reject(new DemoModeError("Resuming a run")); }
+  cancelRun() { return Promise.reject(new DemoModeError("Cancelling a run")); }
+  async policy() { return { ...(await this.pick("policy")), editable: false }; }
+  savePolicy() { return Promise.reject(new DemoModeError("Changing the approval policy")); }
+  resetPolicy() { return Promise.reject(new DemoModeError("Changing the approval policy")); }
+  audit() { return this.pick("audit"); }
+  verifyAudit() { return this.pick("audit_verify"); }
+  security() { return this.pick("security"); }
+  keys() { return Promise.resolve([]); }
+  createKey() { return Promise.reject(new DemoModeError("Creating an API key")); }
+  revokeKey() { return Promise.reject(new DemoModeError("Revoking an API key")); }
 }
 
 export function createBackend(config) {

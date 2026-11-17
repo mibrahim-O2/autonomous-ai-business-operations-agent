@@ -1,4 +1,4 @@
-import { badge, card, emptyState, fmt, h, json, kv, statusBadge, table, tabs } from "../ui.js";
+import { badge, card, confirmDialog, emptyState, fmt, h, json, kv, riskBadge, statusBadge, table, tabs, toast } from "../ui.js";
 
 export const title = "Execution history";
 
@@ -47,7 +47,65 @@ function toolItem(call) {
     call.untrusted ? badge("untrusted content", "warn plain") : null, call.error ? h("span", { class: "small", text: call.error }) : null);
 }
 
-async function renderDetail({ api, param, isDemo, setTitle, onCleanup }) {
+// Pause, resume, and cancel. The buttons offered are the ones the backend says make sense for this
+// run and this caller; the result shown is the state the backend reports afterwards.
+function controlBar(run, { api, isDemo, redraw }) {
+  const c = run.controls || {};
+  const act = async (button, label, call, confirm) => {
+    if (confirm && !(await confirmDialog(confirm))) return;
+    button.disabled = true;
+    try {
+      const result = await call();
+      const now = result.status ? ` Status now: ${result.status.replaceAll("_", " ")}.` : "";
+      toast(`${label}.${now}`, "ok");
+    } catch (error) { toast(error.message, "bad"); }
+    await redraw();
+  };
+  const pause = h("button", { class: "btn small", text: "Pause", disabled: isDemo || !c.pause,
+    title: "Stop at the next step boundary. A step already running finishes first.",
+    onClick: (e) => act(e.currentTarget, "Pause requested", () => api.pauseRun(run.run_id)) });
+  const resume = h("button", { class: "btn small primary", text: "Resume", disabled: isDemo || !c.resume,
+    title: "Continue from the last checkpoint. Completed actions are not repeated.",
+    onClick: (e) => act(e.currentTarget, "Resume requested", () => api.resumeRun(run.run_id)) });
+  const cancel = h("button", { class: "btn small danger", text: "Cancel run", disabled: isDemo || !c.cancel,
+    onClick: (e) => act(e.currentTarget, "Cancel requested", () => api.cancelRun(run.run_id),
+      { title: "Cancel this run?", text: "The run stops for good. A step already running stops at its next boundary. Pending approval requests for this run are withdrawn. Actions already taken are not undone.", confirmLabel: "Cancel run", danger: true }) });
+  const pending = (run.approvals || []).filter((a) => a.status === "pending");
+  return h("div", { class: "row spread" },
+    h("div", { class: "controls" }, pause, resume, cancel),
+    h("div", { class: "row" },
+      run.being_executed ? badge("a worker is executing this run", "info plain") : null,
+      pending.length ? h("a", { class: "btn small", href: "#/approvals", text: `Decide ${pending.length} waiting approval${pending.length > 1 ? "s" : ""}` }) : null,
+      isDemo ? badge("controls disabled in the demo", "plain") : null));
+}
+
+function safetyNotes(run) {
+  const notes = [];
+  const unresolved = (run.final_report && run.final_report.unresolved_side_effects) || [];
+  for (const u of unresolved) {
+    notes.push(h("div", { class: "callout bad", role: "alert" }, h("strong", { text: "Check by hand" }),
+      h("span", { text: `${u.tool} in step ${u.step} may or may not have happened: the call did not answer in time and was not retried. Arguments: ${JSON.stringify(u.arguments)}` })));
+  }
+  if ((run.injection_findings || []).length) {
+    notes.push(h("div", { class: "callout warn" }, h("strong", { text: "Suspected injection" }),
+      h("span", { text: `Text read by this run looked like instructions to the agent (${[...new Set(run.injection_findings.map((f) => f.pattern))].join(", ")}). It was treated as data; actions on this run are held to a stricter approval policy.` })));
+  }
+  return notes;
+}
+
+function approvalsCard(run) {
+  if (!(run.approvals || []).length) return null;
+  return card("Approvals in this run", table([
+    { label: "Tool", render: (a) => h("span", { class: "mono", text: a.tool }) },
+    { label: "Risk", render: (a) => riskBadge(a.risk) },
+    { label: "Rule", render: (a) => a.rule },
+    { label: "Decision", render: (a) => statusBadge(a.status) },
+    { label: "By", render: (a) => a.decided_by || "-" },
+    { label: "Comment", render: (a) => a.comment || "-", class: "truncate" },
+  ], run.approvals), { sub: "Every action the policy held for a person, and what was decided" });
+}
+
+async function renderDetail({ api, param, isDemo, setTitle, onCleanup, updatePendingCount }) {
   const root = h("div", { class: "stack" });
   let view = "steps";
   let timer;
@@ -55,7 +113,7 @@ async function renderDetail({ api, param, isDemo, setTitle, onCleanup }) {
     const [run, timeline] = await Promise.all([api.run(param), api.timeline(param)]);
     setTitle(`Run ${run.run_id}`);
     const handoffs = timeline.filter((e) => e.kind === "step.handoff");
-    const recovery = timeline.filter((e) => ["step.retry_scheduled", "plan.replanned", "plan.invalid", "plan.fallback"].includes(e.kind));
+    const recovery = timeline.filter((e) => ["step.retry_scheduled", "step.timed_out", "plan.replanned", "plan.invalid", "plan.fallback", "run.recovery_started", "run.stale_worker_stopped", "tool.intent_recovered", "tool.intent_unresolved"].includes(e.kind));
     const panes = {
       steps: () => run.steps.length ? h("ol", { class: "steps" }, run.steps.map((s) => h("li", { class: "step" },
         h("span", { class: `step-dot ${STEP_TONE[s.status] || ""}`, text: String(s.index + 1) }),
@@ -79,6 +137,8 @@ async function renderDetail({ api, param, isDemo, setTitle, onCleanup }) {
     root.replaceChildren(...[
       h("div", { class: "row spread" }, h("a", { href: "#/runs", text: "Back to execution history" }),
         !run.terminal && !isDemo ? badge("live: refreshing every second", "info") : null),
+      run.controls && !run.terminal ? controlBar(run, { api, isDemo, redraw: async () => { await draw(); if (updatePendingCount) updatePendingCount(); } }) : null,
+      ...safetyNotes(run),
       h("div", { class: "grid split" },
         card("Summary", kv([
           ["Objective", run.objective], ["Workflow", fmt.title(run.workflow || "unclassified")], ["Status", statusBadge(run.status)],
@@ -92,11 +152,13 @@ async function renderDetail({ api, param, isDemo, setTitle, onCleanup }) {
           ["Model calls", fmt.int(run.usage.calls)], ["Tokens (in / out)", `${fmt.int(run.usage.input_tokens)} / ${fmt.int(run.usage.output_tokens)}`],
           ["Estimated cost", fmt.usd(run.usage.cost_usd)],
         ]))),
+      approvalsCard(run),
       (handoffs.length || recovery.length) ? card("Handoffs, retries, and recovery", h("ul", { class: "activity" }, [...handoffs, ...recovery].map((e) => h("li", {}, h("span", { class: "dot warn" }),
         h("div", {}, h("strong", { text: fmt.title(e.kind.replace(".", " ")) }), h("div", { class: "small muted",
           text: e.kind === "step.handoff" ? `${e.step}: ${e.from_agent} handed to ${e.to_agent} (${e.reason || "no reason given"})`
             : e.kind === "plan.replanned" ? `Plan version ${e.version} replaced steps after ${e.failed_step} failed`
-              : `${e.step || ""} ${e.error || ""}`.trim() })))))) : null,
+              : e.kind === "step.retry_scheduled" ? `${e.step}: attempt ${e.attempt} failed; retrying after ${e.delay_s ?? 0} s`
+                : `${e.step || e.tool || ""} ${e.error || e.reason || ""}`.trim() })))))) : null,
       h("section", { class: "card card-body" },
         tabs([{ id: "steps", label: "Steps and tool calls" }, { id: "timeline", label: `Trace (${timeline.length})` }, { id: "memory", label: "Working memory" }, { id: "report", label: "Final report" }], show, view),
         pane),

@@ -278,3 +278,20 @@ def test_demo_snapshot_matches_the_contract_and_holds_no_private_data():
     assert emails and all(e.endswith(".example") for e in emails), "only fictional .example addresses may appear"
     model = snapshot["settings"]["model"]
     assert not model["openai_key_configured"] and not model["anthropic_key_configured"]
+
+
+def test_demo_snapshot_has_the_data_the_new_screens_read_and_nothing_secret():
+    snapshot = json.loads((DASHBOARD / "demo" / "snapshot.json").read_text())
+    for key in ("approvals", "policy", "audit", "audit_verify", "security"):
+        assert key in snapshot, key
+    assert {"pending", "approved", "rejected"} <= set(snapshot["approvals"]["counts"])
+    assert snapshot["audit_verify"]["ok"]
+    raw = json.dumps(snapshot)
+    for leak in ("bzk_", "secret_hash", "/tmp/", "Bearer "):
+        assert leak not in raw, leak
+    # The demo backend must refuse every decision and control action, whatever the recording says.
+    api = (DASHBOARD / "assets" / "js" / "api.js").read_text()
+    demo = api[api.index("class DemoBackend") :]
+    for method in ("decide()", "pauseRun()", "resumeRun()", "cancelRun()", "savePolicy()", "createKey()"):
+        assert f"{method} {{ return Promise.reject(new DemoModeError(" in demo, method
+    assert "a.can_decide = false" in demo

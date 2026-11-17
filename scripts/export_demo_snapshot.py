@@ -2,7 +2,8 @@
 
 The snapshot is not hand-written. This script starts the real runtime on a
 temporary database with the offline scripted model, runs the demonstration
-workflows (including a retry and a replanning case), calls the same dashboard
+workflows (including a retry, a replanning case, an approved batch, a
+rejected refund, and a refund left waiting for a decision), calls the same dashboard
 API the live application serves, and writes the responses to
 dashboard/demo/snapshot.json. The static demo then replays exactly what the
 backend returned, and labels it as recorded sample data.
@@ -25,6 +26,10 @@ from bizops.core.config import Settings
 from bizops.core.models import Task
 from bizops.demo import SCENARIOS
 from bizops.runtime import build_runtime
+from bizops.security import Principal, Role
+
+# The fictional person recorded as making the demo's decisions.
+RECORDER = Principal(name="demo-approver", tenant_id="demo", role=Role.ADMIN, kind="system")
 
 OUT = Path(__file__).resolve().parents[1] / "dashboard" / "demo" / "snapshot.json"
 SAMPLE_QUERIES = [
@@ -36,12 +41,44 @@ SAMPLE_QUERIES = [
 
 
 async def run_scenarios(rt) -> None:
+    states = {}
     for name, scenario in SCENARIOS.items():
-        await rt.orchestrator.submit(
+        if name == "refund_request":
+            continue  # recorded below, in two variants
+        states[name] = await rt.orchestrator.submit(
             Task(
                 objective=scenario["objective"], workflow=name, inputs=scenario["inputs"], requested_by="demo-recording"
             )
         )
+    # Collections stops for a person before the first reminder. A recorded approver approves the batch.
+    collections = states["invoice_collections"]
+    rt.approvals.decide(
+        RECORDER, collections.pending_approval_id, True, "Policy applied correctly; send both.", scope="step_tool"
+    )
+    await rt.orchestrator.resume("demo", collections.run_id)
+    # A refund that a recorded approver rejects: the run hands the case to finance instead.
+    refund = SCENARIOS["refund_request"]
+    rejected = await rt.orchestrator.submit(
+        Task(
+            objective=refund["objective"],
+            workflow="refund_request",
+            inputs={**refund["inputs"], "amount": 120, "reason": "Partial refund requested by email"},
+            requested_by="demo-recording",
+        )
+    )
+    rt.approvals.decide(
+        RECORDER, rejected.pending_approval_id, False, "Partial refunds need the account manager first."
+    )
+    await rt.orchestrator.resume("demo", rejected.run_id)
+    # A refund left waiting, so the demo shows what an approver sees. Nothing will ever decide it.
+    await rt.orchestrator.submit(
+        Task(
+            objective=refund["objective"],
+            workflow="refund_request",
+            inputs=refund["inputs"],
+            requested_by="demo-recording",
+        )
+    )
     # A transient calendar fault: the step is retried and succeeds.
     rt.mock_control.set_fault("demo", "calendar.find_slots", times=1, retryable=True, message="calendar timed out")
     lead = {
@@ -99,6 +136,11 @@ def main() -> None:
                 "searches": {q: client.post("/api/knowledge/search", json={"query": q}).json() for q in SAMPLE_QUERIES},
                 "memory": get("/memory"),
                 "settings": settings,
+                "approvals": get("/approvals"),
+                "policy": get("/policy"),
+                "audit": get("/audit"),
+                "audit_verify": get("/audit/verify"),
+                "security": get("/security"),
             }
         rt.close()
     OUT.parent.mkdir(parents=True, exist_ok=True)
