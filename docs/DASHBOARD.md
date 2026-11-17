@@ -8,7 +8,7 @@ The BizOps Agent Console is the web interface to the platform. It runs in two cl
 |---|---|---|
 | Served by | The Python backend (`bizops serve`) | A static host |
 | Data | Live runtime state through `/api` | A recorded snapshot file |
-| Actions | Real: start workflows, enable or disable agents, ingest and delete documents, forget memory | Disabled, with an explanation |
+| Actions | Real: start workflows, approve or reject held actions, pause, resume, cancel, enable or disable agents, edit the approval policy, ingest and delete documents, forget memory, run evaluations | Disabled, with an explanation |
 | Indicator | "Local: offline scripted model" or "Live: provider model" | "Demo mode: sample data" badge and a banner on every page |
 | Secrets | Never sent to the browser | None exist |
 
@@ -22,11 +22,11 @@ Open http://127.0.0.1:8000. No API key and no model key are needed: the offline 
 
 ## Technology choice
 
-The dashboard is a static application written in plain ES modules with hand-written CSS and SVG charts. There is no framework, no bundler, and no package to install.
+The dashboard is a static application written in plain ES modules with hand-written CSS and SVG charts. There is no framework, no bundler, and no package to install. Three open-licence fonts are self-hosted in `assets/fonts`, so the page still loads nothing from third parties.
 
 | Considered | Decision | Reason |
 |---|---|---|
-| React or Vue with a build step | Not chosen | Adds a Node toolchain, a lockfile, and a build to keep working for a console of about ten screens. The benefit (components, ecosystem) did not outweigh the maintenance and supply-chain surface. |
+| React or Vue with a build step | Not chosen | Adds a Node toolchain, a lockfile, and a build to keep working for a console of twelve screens. The benefit (components, ecosystem) did not outweigh the maintenance and supply-chain surface. |
 | Server-rendered templates | Not chosen | Cannot be hosted on GitHub Pages, which serves static files only. |
 | Static ES modules (chosen) | Chosen | Runs unchanged from the Python backend and from GitHub Pages; nothing to build or deploy except files; no third-party code or network requests, which allows a strict content security policy. |
 
@@ -74,8 +74,8 @@ Regenerate the snapshot after changing the API or the demonstration data:
 | Memory | Semantic and episodic records with search | Forget a record |
 | Security and reliability | Your identity and permissions, the role table, the approval policy and its effect per tool, suspected injection across runs, reliability limits and faults handled, the audit log with a chain check | Edit or reset the policy (admin), verify the audit chain |
 | Settings | Provider and model, whether keys are configured (never their values), run limits, integration adapters, access mode, environment | None; configuration is by environment variable |
-
-The Observability and Evaluation screens are added with the final pull request.
+| Observability | Model calls, tokens, cost, runs per day, latency p50 and p95 per operation, workflow outcomes with success rates, tool reliability, usage by agent and model, recent problems and recoveries, and a searchable, paged trace log | Filter and page the trace log |
+| Evaluation | The evaluation suite: totals, category and retrieval meters, every case with each check and its evidence, labelled retrieval questions with ranks, and history | Run the suite (with a cost warning when a live model is configured) |
 
 ## API contract
 
@@ -98,6 +98,8 @@ All endpoints are under `/api` and return JSON.
 | `GET /audit`, `GET /audit/verify` | Audit log and chain verification |
 | `GET /me`, `GET /security` | The caller's identity and permissions; security and reliability posture |
 | `GET /keys`, `POST /keys`, `DELETE /keys/{id}` | API keys for the caller's tenant (admin); a new token is returned once |
+| `GET /observability`, `GET /events` | Latency, usage, cost, tool and workflow statistics; the trace as a filterable, paged log |
+| `GET /evaluations`, `GET /evaluations/{id}`, `POST /evaluations/run` | Evaluation cases, stored results, and a background run (operator) |
 
 Every endpoint takes its tenant from the authenticated principal and checks one permission. A refused attempt is answered with 403 and written to the audit log.
 
@@ -115,7 +117,22 @@ Known limitation: the console has not been tested with assistive technology beyo
 
 ## Design system
 
-Tokens for colour, spacing, radius, and shadow are CSS custom properties with light and dark values. Status colours are consistent everywhere: green for success, amber for waiting or caution, red for failure or high risk, blue for in progress or informational. Layout switches from four columns to two to one as the viewport narrows; the sidebar becomes a drawer below 860 pixels; tables scroll inside their cards. Motion respects the reduced-motion preference.
+The visual identity is emerald and teal on warm white, with charcoal for structure. Blue and purple are deliberately absent; a test fails if a blue or purple colour is introduced.
+
+| Token | Light | Dark | Use |
+|---|---|---|---|
+| Background | warm white `#f6f4ef` | charcoal `#111513` | Page |
+| Surface | `#fffdf9` | `#171c1a` | Cards, tables, dialogs |
+| Text | charcoal `#1c2320` | warm white `#ece9e1` | Body text |
+| Primary | emerald `#0d7a57` | `#3ccf95` | Actions, links, focus, success |
+| In progress | teal `#0f766e` | `#3cc6b6` | Running, informational |
+| Waiting | amber `#9a5a06` | `#f0b04a` | Waiting for approval, pending, caution |
+| Failure | brick red `#b3261e` | `#f2806c` | Failed, rejected, high risk |
+| Sidebar | charcoal `#171c1a` | `#0c0f0e` | Navigation |
+
+Typography: **Manrope** for the interface (warm, highly legible at small sizes), **Fraunces** for page titles, card titles, and key figures, and **JetBrains Mono** for identifiers, tool names, and data. All three are variable fonts under the SIL Open Font Licence, about 100 KB together, preloaded and shown with `font-display: swap`.
+
+Status colours mean the same thing everywhere, and every status also has a text label, so colour is never the only signal. Layout moves from four columns to two as the viewport narrows; on a phone, summary cards stay two per row, the sidebar becomes a drawer below 860 pixels, wide tables scroll inside their card, and charts keep legible labels. Focus rings are always visible. Motion is limited to a short settle on page change and respects the reduced-motion preference.
 
 ## Verification performed
 

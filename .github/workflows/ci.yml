@@ -28,3 +28,22 @@ jobs:
         run: for f in $(find dashboard/assets/js -name '*.js'); do node --check "$f"; done
       - name: Test
         run: pytest
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t bizops-agent:ci .
+      - name: Start it and check health, authentication, and the demo workflow
+        run: |
+          docker run -d --name bizops -p 127.0.0.1:8000:8000 -e BIZOPS_API_KEY=ci-only-key --read-only --tmpfs /tmp bizops-agent:ci
+          for i in $(seq 1 30); do curl -fs http://127.0.0.1:8000/health && break; sleep 1; done
+          curl -fs http://127.0.0.1:8000/health
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/api/meta)" = "401"
+          curl -fs -H 'Authorization: Bearer ci-only-key' http://127.0.0.1:8000/api/meta
+          docker exec bizops bizops demo lead
+          test "$(docker inspect -f '{{.Config.User}}' bizops)" = "bizops"
+      - name: Logs
+        if: always()
+        run: docker logs bizops || true

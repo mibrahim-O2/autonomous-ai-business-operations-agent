@@ -228,8 +228,12 @@ The tenant of a webhook comes from the secret that signed it. `BIZOPS_WEBHOOK_SE
 | The process dies | At start-up the server resumes runs marked running whose lease has expired; `bizops recover` does the same on demand |
 | A model provider is rate limited | Retried with backoff, honouring `Retry-After` |
 
-## 15. Planned work
+## 15. Evaluation and observability
 
-| Pull request | Adds |
-|---|---|
-| 4 | Evaluation framework, observability and evaluation screens, GitHub Pages deployment, Docker, deployment guide, manual testing guide |
+`evaluation/` holds ten scenario cases and a labelled retrieval set. Each case runs end to end on its own temporary database with the deployment's model and is judged by checks on effects (business records, approval records, the trace), never on what an agent reported. Results are stored per tenant in the `evaluations` table and served by `/api/evaluations`. Sabotage tests (a policy that skips approval, a model that obeys injected text) confirm that the checks fail when they should.
+
+The observability endpoints compute latency percentiles, usage, cost, tool error rates, and workflow success rates from the stored trace (`events` table) on request. That is adequate for a single node with thousands of runs; at larger scale the trace would be exported to a time-series or tracing system and these figures read from there.
+
+## 16. Deployment
+
+One process serves the API, the dashboard, and the worker. The Docker image runs it as an unprivileged user on a read-only filesystem with state on a volume. The GitHub Pages workflow publishes only the static dashboard in demo mode. Several processes may share one SQLite database (leases and fencing make that safe); scaling beyond one machine means moving storage to a networked database, which the `Database` class isolates. See [DEPLOYMENT.md](DEPLOYMENT.md).

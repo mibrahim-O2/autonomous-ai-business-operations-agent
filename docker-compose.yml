@@ -1,0 +1,34 @@
+# Local full stack in a container: API, background worker, and dashboard on http://127.0.0.1:8000
+#
+#   cp .env.example .env        # then set BIZOPS_API_KEY to a long random value
+#   docker compose up --build
+#
+# Inside a container the browser is not on the loopback interface, so the local-only mode does
+# not apply and an API key is required. The dashboard asks for it and keeps it in memory only.
+services:
+  bizops:
+    build:
+      context: .
+      args:
+        EXTRAS: "${BIZOPS_EXTRAS:-}"          # set BIZOPS_EXTRAS=[openai] to include the OpenAI SDK
+    image: bizops-agent:local
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      BIZOPS_DATA_DIR: /data
+      BIZOPS_API_KEY: "${BIZOPS_API_KEY:?Set BIZOPS_API_KEY in .env: the containerised API requires a key}"
+    ports:
+      - "127.0.0.1:8000:8000"                 # reachable from this machine only
+    volumes:
+      - bizops-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+volumes:
+  bizops-data:

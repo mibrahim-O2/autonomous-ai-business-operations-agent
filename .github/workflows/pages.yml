@@ -1,0 +1,50 @@
+name: Deploy dashboard demo to GitHub Pages
+
+# Publishes the static dashboard in its read-only demo mode. GitHub Pages cannot run the Python
+# backend, so the published site replays a recorded snapshot and is labelled as sample data.
+on:
+  push:
+    branches: [main]
+    paths: ["dashboard/**", ".github/workflows/pages.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assemble the static site
+        run: |
+          mkdir -p _site
+          cp -r dashboard/. _site/
+          touch _site/.nojekyll
+      - name: Check that the published site is in demo mode and carries no secrets
+        run: |
+          grep -q 'mode: "demo"' _site/config.js || { echo "config.js must select demo mode"; exit 1; }
+          if grep -rEl 'bzk_[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{20,}|"secret_hash"|Bearer [A-Za-z0-9]' _site; then
+            echo "possible secret in the published files"; exit 1
+          fi
+          python3 -c "import json; json.load(open('_site/demo/snapshot.json'))"
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

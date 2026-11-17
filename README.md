@@ -4,7 +4,11 @@ Author: Muhammad Ibrahim
 
 A multi-agent platform that takes a business task, plans it, delegates steps to specialist agents, executes them through controlled tools, and reports a verified result, with every step checkpointed and traced.
 
-> **Status:** the project is being delivered in four pull requests. This README describes what is on `main` now. The roadmap lists what each remaining pull request adds.
+**Live demo (read-only, recorded sample data):** https://mibrahim-o2.github.io/autonomous-ai-business-operations-agent/
+
+![Approval Center: a refund held for a person, with the exact arguments, the rule that stopped it, and who may decide](docs/images/approvals.png)
+
+> **Status:** version 1.0.0, delivered in four pull requests. Everything below runs offline with no API key; a hosted model is optional.
 
 ## What works today
 
@@ -30,7 +34,10 @@ A multi-agent platform that takes a business task, plans it, delegates steps to 
 | Injection defences | Outside-authored text reaches the model only in a labelled data envelope, taints the run (tightening the policy), and is scanned; suspected injection and outside-only addresses are shown to approvers |
 | Reliability | Single-writer runs (leases, fencing tokens, exactly-once side effects), step and tool timeouts, retry backoff with jitter, recovery of interrupted runs at start-up, unknown outcomes reported rather than hidden |
 | Tenancy | Every stored row and query is scoped to a tenant; the MCP client injects the tenant so a model cannot choose it |
-| Dashboard | Web console backed by the live API: overview, workflows, Approval Center, execution history with pause, resume, and cancel, agents, MCP and tools, knowledge, memory, security and reliability (policy, roles, audit log), settings; light and dark themes; responsive; read-only demo mode for static hosting |
+| Evaluation | Ten end-to-end scenarios judged by checks on business records, approvals, and the trace; a labelled retrieval set (hit at 1, recall at 3, MRR, trust filtering); sabotage tests prove the checks can fail; runs on the offline model or a live one |
+| Observability | Latency percentiles per operation, tokens and cost by workflow, agent, and model, tool error rates, workflow success rates, recent problems, and a searchable trace log |
+| Dashboard | Twelve screens backed by the live API: overview, workflows, Approval Center, execution history with pause, resume, and cancel, agents, MCP and tools, knowledge, memory, observability, evaluation, security and reliability, settings; emerald and charcoal design system with light and dark themes; responsive to phone width; read-only demo mode on GitHub Pages |
+| Deployment | Hardened Docker image and Compose file (non-root, read-only filesystem, health check, key required); GitHub Actions for tests, Docker smoke test, and Pages |
 
 ## Architecture
 
@@ -91,13 +98,18 @@ The default policy holds every high-risk action (external, financial, irreversib
 
 ## Dashboard
 
+| | |
+|---|---|
+| ![Overview](docs/images/overview.png) | ![Run detail with run controls and approvals](docs/images/run-detail.png) |
+| ![Observability in the dark theme](docs/images/observability.png) | ![Evaluation results](docs/images/evaluation.png) |
+
 A web console is served by the backend:
 
 ```bash
 .venv/bin/bizops serve
 ```
 
-Open http://127.0.0.1:8000. It shows live data from the runtime and can start workflows, approve or reject held actions in the Approval Center, pause, resume, or cancel runs, enable or disable agents, edit the approval policy, verify the audit log, search and ingest knowledge, and inspect every run's steps, tool calls, trace, and report. The same static files run on GitHub Pages in a read-only demo mode that replays a recorded snapshot and is labelled as sample data. Details, the technology choice, and the security model are in [docs/DASHBOARD.md](docs/DASHBOARD.md).
+Open http://127.0.0.1:8000. It shows live data from the runtime and can start workflows, approve or reject held actions in the Approval Center, pause, resume, or cancel runs, enable or disable agents, edit the approval policy, verify the audit log, search and ingest knowledge, and inspect every run's steps, tool calls, trace, and report, read latency, usage, and cost, and run the evaluation suite. The same static files run on GitHub Pages in a read-only demo mode that replays a recorded snapshot and is labelled as sample data. Details, the technology choice, and the security model are in [docs/DASHBOARD.md](docs/DASHBOARD.md).
 
 ## MCP architecture
 
@@ -141,18 +153,32 @@ python3 -m venv .venv
 ```
 
 ```bash
+.venv/bin/bizops demo refund
+```
+
+```bash
 .venv/bin/bizops demo inbox
 ```
 
-Example output of the collections demonstration:
+Example output of the lead demonstration:
 
 ```
-Run run_63d39d37fed9  status=completed  replans=0  model_calls=9  cost_usd=0.0  tainted=False
-Plan v1: Follow the invoice_collections playbook (version 1).
-  1. [succeeded] research.research_policy  Policy retrieved from 4 passages after 1 search(es).
-  2. [succeeded] finance_ops.review_overdue  Reviewed 3 overdue invoices; 2 reminders due.
-  3. [succeeded] finance_ops.send_reminders  Sent 2 reminders; 0 not sent.
+Run run_e77f1456c2c2  status=completed  replans=0  model_calls=14  cost_usd=0.0  tainted=False
+Plan v1: Follow the lead_intake playbook (version 1).
+  1. [succeeded] research.recall_context  Found 0 relevant memories.
+  2. [succeeded] research.research_policy  Policy retrieved from 4 passages after 1 search(es).
+  3. [succeeded] sales_ops.qualify_lead  Lead qualified as hot with score 85.
+  4. [succeeded] communications.draft_reply  Reply drafted and saved (not sent).
+  5. [succeeded] scheduling.propose_slots  Proposed 4 slots.
 Outcome: verified  (verification passed: True)
+```
+
+The collections and refund demonstrations stop before any external or financial action and print the approval request; decide it with `bizops approve` or in the dashboard.
+
+Start the dashboard:
+
+```bash
+.venv/bin/bizops serve
 ```
 
 Inspect what changed in the mock systems:
@@ -168,6 +194,7 @@ Inspect what changed in the mock systems:
 | `lead_intake` | CLI or `lead.created` webhook | Recall context, retrieve the sales playbook, qualify and store the lead, draft a reply, propose meeting slots |
 | `invoice_collections` | CLI or `invoices.review_requested` webhook | Retrieve the collections policy, review overdue invoices, send permitted reminders, escalate if no policy is found |
 | `inbox_triage` | CLI or `email.received` webhook | Read unread mail as untrusted data, classify it, draft acknowledgements, raise tasks for people |
+| `refund_request` | CLI or dashboard | Retrieve the refund policy, check eligibility against the invoice record, wait for a person to approve, issue the refund once, draft a confirmation |
 
 ## Commands
 
@@ -210,17 +237,37 @@ Create a key for each person or system (`bizops keys create ci --role viewer`), 
 
 A webhook is verified, mapped to a task, queued, and acknowledged with 202. The worker executes it. A repeated event id is acknowledged as a duplicate and does not start a second run. The tenant comes from the secret that signed the request (`BIZOPS_WEBHOOK_SECRETS` binds more senders to tenants); a body naming another tenant is refused. With no key configured at all, the API answers only the same machine. Details: [docs/SECURITY-MODEL.md](docs/SECURITY-MODEL.md).
 
+## Docker
+
+```bash
+cp .env.example .env
+```
+
+Set `BIZOPS_API_KEY` in `.env` to a long random value, then:
+
+```bash
+docker compose up --build
+```
+
+The container runs as an unprivileged user on a read-only filesystem, keeps state on a volume, publishes on 127.0.0.1 only, and requires the key. Details: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
 ## Configuration
 
 Copy `.env.example` to `.env`. All settings and the hosted-model option are described in [docs/SETUP.md](docs/SETUP.md).
 
-## Testing
+## Testing and evaluation
 
 ```bash
 .venv/bin/pytest
 ```
 
-The suite runs offline in about twenty seconds. It covers storage, memory, the tool gateway, planning, end-to-end orchestration (retry, replanning, pause and resume, restart recovery, idempotency, tenant isolation), concurrency (stalled workers, fencing, simultaneous resume), human approval (approve, reject, expiry, roles, single decision, binding to arguments, batch approval, cancellation), access control and tenant isolation over HTTP, webhook tenant binding, audit chain tampering, prompt-injection handling, timeouts, backoff, crash recovery, model provider validation and retries, the MCP server in-process and over stdio, mock integrations, the HTTP integration framework, retrieval, the job queue, the webhook API, and the dashboard API and static assets.
+```bash
+.venv/bin/bizops eval
+```
+
+The test suite runs offline in about twenty-five seconds on Python 3.11 and 3.13; CI also builds the Docker image and smoke-tests it. The evaluation suite runs ten business scenarios and a retrieval question set against the configured model. A step-by-step manual testing guide with 47 cases and a report template are in [docs/MANUAL-TESTING.md](docs/MANUAL-TESTING.md) and [docs/MANUAL-TEST-REPORT.md](docs/MANUAL-TEST-REPORT.md); details in [docs/TESTING.md](docs/TESTING.md).
+
+The tests cover storage, memory, the tool gateway, planning, end-to-end orchestration (retry, replanning, pause and resume, restart recovery, idempotency, tenant isolation), concurrency (stalled workers, fencing, simultaneous resume), evaluation (including sabotage cases that must fail), observability, human approval (approve, reject, expiry, roles, single decision, binding to arguments, batch approval, cancellation), access control and tenant isolation over HTTP, webhook tenant binding, audit chain tampering, prompt-injection handling, timeouts, backoff, crash recovery, model provider validation and retries, the MCP server in-process and over stdio, mock integrations, the HTTP integration framework, retrieval, the job queue, the webhook API, and the dashboard API and static assets.
 
 ## Demo data and safety
 
@@ -234,8 +281,10 @@ High-risk tools such as sending reminders and issuing refunds wait for a person 
 |---|---|---|
 | 1 | Architecture, orchestration, agents, memory, state, tracing, first workflow | Merged |
 | 2 | MCP server and tools, integrations, webhooks, job queue, document retrieval and agentic RAG, dashboard | Merged |
-| 3 | Human approval policies, access control, audit trail, injection defences, reliability, Approval Center | This pull request |
-| 4 | Evaluation framework, observability and evaluation screens, GitHub Pages deployment, Docker, deployment and manual testing guides | Planned |
+| 3 | Human approval policies, access control, audit trail, injection defences, reliability, Approval Center | Merged |
+| 4 | Evaluation framework, observability and evaluation screens, dashboard redesign, GitHub Pages deployment, Docker, deployment and manual testing guides | Merged |
+
+Possible next steps, not implemented: a semantic embedding model behind the existing `Embedder` interface, PostgreSQL storage for multi-node deployments, real CRM and email adapters for specific vendors, and anchoring the audit head hash outside the database.
 
 ## Project documents
 
@@ -243,6 +292,9 @@ High-risk tools such as sending reminders and issuing refunds wait for a person 
 - [Setup guide](docs/SETUP.md)
 - [Security model](docs/SECURITY-MODEL.md)
 - [Using a live model](docs/LIVE-MODELS.md)
+- [Deployment](docs/DEPLOYMENT.md)
+- [Testing and evaluation](docs/TESTING.md)
+- [Manual testing guide](docs/MANUAL-TESTING.md) and [report template](docs/MANUAL-TEST-REPORT.md)
 - [Dashboard](docs/DASHBOARD.md)
 - [Connecting real integrations](REAL-INTEGRATIONS-SETUP.md)
 - [Contributing](CONTRIBUTING.md)

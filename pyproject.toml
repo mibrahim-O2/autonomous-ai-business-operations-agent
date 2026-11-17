@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autonomous-ai-business-operations-agent"
-version = "0.3.0"
+version = "1.0.0"
 description = "Multi-agent business operations platform with MCP tools, agentic RAG, memory, and human-in-the-loop execution control."
 readme = "README.md"
 requires-python = ">=3.11"

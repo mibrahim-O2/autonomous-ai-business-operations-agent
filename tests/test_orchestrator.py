@@ -322,3 +322,17 @@ def test_idempotency_race_is_resolved_by_the_unique_index(rt, monkeypatch):
     monkeypatch.setattr(rt.db, "find_run_by_idempotency_key", find_after_miss)
     second = run(rt.orchestrator.submit(lead_task(idempotency_key="race-1")))
     assert second.run_id == first.run_id and len(rt.db.list_runs("demo")) == 1
+
+
+def test_cli_can_create_a_run_paused_and_resume_it(tmp_path, monkeypatch, capsys):
+    """`--paused` stops the run at its first step boundary through the normal pause signal."""
+    from bizops import cli
+
+    monkeypatch.setenv("BIZOPS_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(cli, "build_runtime", lambda: started(make_settings(tmp_path)))
+    assert cli.main(["demo", "lead", "--paused"]) == 0
+    out = capsys.readouterr().out
+    assert "status=paused" in out and "bizops resume run_" in out
+    run_id = out.split("bizops resume ")[1].split()[0]
+    assert cli.main(["resume", run_id]) == 0
+    assert "status=completed" in capsys.readouterr().out

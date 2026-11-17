@@ -109,6 +109,15 @@ async def _dispatch(args: argparse.Namespace, rt: Runtime) -> int:
                 inputs=_parse_inputs(args.input),
                 idempotency_key=args.idempotency_key,
             )
+        if args.paused:
+            # Create the run with a pause already requested: it stops at its first step boundary,
+            # exactly as when Pause is pressed during a run. Continue it with `bizops resume`.
+            created, _ = rt.orchestrator.create(task)
+            rt.orchestrator.request_pause(created.tenant_id, created.run_id)
+            state = await rt.orchestrator.drive(created.tenant_id, created.run_id)
+            _print_run(state)
+            print(f"\nPaused before it did anything. Continue with:  bizops resume {state.run_id}")
+            return 0
         state = await rt.orchestrator.submit(task)
         _print_run(state)
         if state.status.value == "waiting_approval":
@@ -281,12 +290,14 @@ def build_parser() -> argparse.ArgumentParser:
     demo = sub.add_parser("demo", help="run a demonstration workflow")
     demo.add_argument("scenario", nargs="?", default="lead", choices=sorted(DEMOS))
     demo.add_argument("--json", action="store_true")
+    demo.add_argument("--paused", action="store_true", help="create the run paused, to test pause and resume")
     run = sub.add_parser("run", help="submit a task")
     run.add_argument("objective")
     run.add_argument("--workflow", default=None)
     run.add_argument("--input", action="append", default=[], metavar="KEY=VALUE")
     run.add_argument("--idempotency-key", default=None)
     run.add_argument("--json", action="store_true")
+    run.add_argument("--paused", action="store_true", help="create the run paused, to test pause and resume")
     for name in ("status", "resume", "pause", "cancel", "trace"):
         command = sub.add_parser(name)
         command.add_argument("run_id")

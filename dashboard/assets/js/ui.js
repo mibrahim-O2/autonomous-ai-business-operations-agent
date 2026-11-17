@@ -26,7 +26,8 @@ export function h(tag, attrs = {}, ...children) {
 const STATUS_TONE = {
   completed: "ok", succeeded: "ok", verified: "ok", indexed: "ok", enabled: "ok", approved: "ok", executed: "ok",
   failed: "bad", rejected: "bad", dead: "bad", cancelled: "bad", error: "bad", disabled: "bad",
-  running: "info", pending: "info", queued: "info",
+  // Teal means in progress; amber means waiting (for a person, a slot, or a decision).
+  running: "info", queued: "info", pending: "warn",
   paused: "warn", waiting_approval: "warn", completed_with_issues: "warn", skipped: "warn",
 };
 const RISK_TONE = { read: "ok", low: "info", medium: "warn", high: "bad" };
