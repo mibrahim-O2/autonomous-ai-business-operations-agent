@@ -49,6 +49,7 @@ from ..observability import Tracer, get_logger
 from ..storage import Database
 from ..tools import ApprovalRequired
 from ..workflows import WorkflowRegistry
+from ..workflows.guides import GUIDES, required_output_keys
 
 log = get_logger("orchestrator")
 MAX_STEP_ATTEMPTS = 2
@@ -108,6 +109,7 @@ class Orchestrator:
         agent_ctx.checkpoint = self._checkpoint
         agent_ctx.gateway.fence_guard = self._assert_current
         agent_ctx.gateway.checkpoint = self._checkpoint
+        agent_ctx.step_guide = self._step_guide
         # Set by the runtime when human approval is configured (ApprovalService).
         self.approvals: Any = None
 
@@ -442,6 +444,16 @@ class Orchestrator:
             state, "step.finished", step=step.action, ok=result.ok, summary=result.summary, error=step.error
         )
         return result
+
+    def _step_guide(self, state: RunState, step: PlanStep) -> dict[str, Any]:
+        """What a hosted model needs beyond the step itself: a method, and the output keys that matter."""
+        workflow = self.workflows.get(state.analysis.get("workflow") or "")
+        expects = workflow.expects.get(step.action, []) if workflow else []
+        later_inputs = [s.inputs for s in state.plan.steps] if state.plan else []
+        return {
+            "guide": GUIDES.get(step.action, ""),
+            "required_output_keys": required_output_keys(step.action, expects, later_inputs),
+        }
 
     async def _run_agent(self, agent: Any, step: PlanStep, state: RunState, inputs: dict[str, Any]) -> AgentResult:
         """Run one specialist on one step under the step time limit."""

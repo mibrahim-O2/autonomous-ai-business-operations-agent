@@ -140,7 +140,11 @@ Retrieval is BM25. The context builder assembles objective, step, inputs, depend
 
 The scripted provider dispatches on a JSON envelope and executes handlers supplied by the workflow library. It is a rule-based stand-in for model reasoning: it drives the same planning, tool-calling, and recovery paths as a hosted model, deterministically. It may only call tools the agent was offered.
 
-The Anthropic and OpenAI-compatible adapters translate the neutral message format to each SDK. They are not exercised by the test suite, which is offline, and have not been run against live APIs in this repository.
+The Anthropic and OpenAI-compatible adapters translate the neutral message format to each SDK and validate what comes back before anything acts on it: a response with no choice, a content-filter refusal, tool arguments that are not a JSON object, or output cut off in the middle of a tool call is an `LLMError`, never a silently wrong action. A provider that omits token usage gets an estimate, so cost limits still apply.
+
+`ResilientLLM` wraps every hosted provider. `classify_provider_error` maps vendor exceptions to retryable (rate limits, timeouts, 5xx, overload) or permanent (authentication, missing model, invalid request, exhausted quota). Retryable errors are retried with exponential backoff and jitter, honouring `Retry-After`, up to `BIZOPS_LLM_MAX_RETRIES`; the SDKs' own retries are switched off so that there is one retry policy. Permanent errors fail the step at once with a message that names the fix and contains no credential.
+
+The adapters are tested against stand-in clients that return SDK-shaped objects. They have not been run against the live APIs in this repository's automated suite; [LIVE-MODELS.md](LIVE-MODELS.md) describes how to check them with your own key.
 
 ## 9. Observability
 
@@ -148,7 +152,38 @@ Every model call, tool call, step, and run is a span with a duration and a paren
 
 ## 10. Security
 
-See `SECURITY.md`. In summary: least-privilege tool allow-lists, schema validation, enforcement below the model, tenant-scoped storage, secrets from the environment only, and taint tracking for untrusted content.
+The full model, including what each control does not protect against, is in [SECURITY-MODEL.md](SECURITY-MODEL.md). In summary: authenticated principals with one tenant and one role; least-privilege tool allow-lists; schema validation; an approval policy enforced below the model; a hash-chained audit log; tenant-scoped storage; secrets from the environment only; and structural handling of outside-authored text.
+
+### Human in the loop
+
+`approvals/policy.py` holds the policy: an ordered list of rules over tool name patterns, declared risk, whether the run has read untrusted content, and a numeric argument threshold. The first matching rule decides `allow`, `require_approval` (naming the role that may decide), or `deny`. `approvals/service.py` holds the requests and `PolicyGate`, the `ApprovalGate` the gateway consults before every side-effecting call.
+
+| Property | How it is achieved |
+|---|---|
+| Nothing executes before a decision | The gate runs before the call; `ApprovalRequired` suspends the run with the step marked waiting |
+| Approval covers exactly what was shown | The request stores the fingerprint of tool and arguments; only a call with that fingerprint is allowed by it |
+| Decided once | `UPDATE ... WHERE status='pending'`; a second decision gets a conflict |
+| Decided by the right person | The principal's role is checked against the rule's required role; refusals are audited |
+| Silence is not consent | Unanswered requests expire into a refusal (`BIZOPS_APPROVAL_TTL_SECONDS`) |
+| Rejection is handled | The agent receives the refusal and reason; the workflow's recovery plan hands the case to a person |
+| Batches | An approver may choose `step_tool` scope: further calls to the same tool in the same step of the same run, under the same rule and role |
+| Cancelling withdraws | Cancelling a run cancels its pending requests |
+
+Waiting for a decision does not consume one of the step's retry attempts, and resuming a run whose request is still pending is a no-op that spends no model calls.
+
+### Prompt-injection handling
+
+1. Tool output marked untrusted is passed to the model inside `{"untrusted_content": ..., "handling": ...}`, which states it is data.
+2. The run is marked tainted; the default policy then holds medium-risk actions as well.
+3. `security/injection.py` scans untrusted output for instruction overrides, role reassignment, prompt probing, text addressed to the assistant, tool directives, and approval avoidance. Findings go to the trace, the run, and every approval request from that run.
+4. Email addresses and links seen only in outside content are recorded; a side-effecting call that uses one is flagged to the approver.
+5. Allow-lists cannot be widened by any content, and high-risk actions need a person regardless of what the model was told.
+
+Detection is a heuristic and is documented as one. Items 1, 2, and 5 do not depend on recognising the attack.
+
+### Audit
+
+`security/audit.py` appends one record per decision, control action, policy or key change, deletion, refused access attempt, and executed or denied side effect. Each record stores the previous record's hash and its own hash over the canonical content, per tenant. `verify` recomputes the chain and reports the first broken record.
 
 ## 11. MCP layer
 
@@ -180,11 +215,21 @@ Documents have a `trusted` flag. A search result that includes untrusted materia
 
 `POST /webhooks/{source}` verifies an HMAC-SHA256 signature over the raw body, requires an event id, maps the event to a workflow, and enqueues a job. The queue is a table; claiming is a conditional update inside a transaction, so two workers cannot take one job. Failed jobs are retried with a growing delay and marked dead after three attempts. A job left running by a dead worker is returned to the queue after ten minutes.
 
-Known gap: the API key and webhook secret are single shared values and do not bind a caller to a tenant. Tenant-bound credentials and roles are part of the access-control work in pull request 3.
+The tenant of a webhook comes from the secret that signed it. `BIZOPS_WEBHOOK_SECRET` signs for the default tenant; `BIZOPS_WEBHOOK_SECRETS` maps further source names to a tenant and secret. A body naming a different tenant is refused and audited.
+
+### Timeouts, retries, and recovery
+
+| Fault | Handling |
+|---|---|
+| A tool call hangs | Cut off after `BIZOPS_TOOL_TIMEOUT_SECONDS`; reported as retryable; the write-ahead intent is kept so the retry sends the same call under the same idempotency key |
+| A specialist hangs | Cut off after `BIZOPS_STEP_TIMEOUT_SECONDS`; retried |
+| A transient failure | The step is retried after exponential backoff with jitter (`BIZOPS_RETRY_BASE_SECONDS`, capped at `BIZOPS_RETRY_MAX_SECONDS`) |
+| Retries run out while an outcome is unknown | The call is listed under `unresolved_side_effects` in the final report and the outcome is `completed_with_issues`, not `verified` |
+| The process dies | At start-up the server resumes runs marked running whose lease has expired; `bizops recover` does the same on demand |
+| A model provider is rate limited | Retried with backoff, honouring `Retry-After` |
 
 ## 15. Planned work
 
 | Pull request | Adds |
 |---|---|
-| 3 | Approval policy engine, approvals with history, access control, audit trail, timeouts, backoff, recovery of interrupted runs, injection defences |
-| 4 | Evaluation framework, dashboard, cost reporting, Docker, deployment guide |
+| 4 | Evaluation framework, observability and evaluation screens, GitHub Pages deployment, Docker, deployment guide, manual testing guide |

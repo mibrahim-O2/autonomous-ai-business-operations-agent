@@ -28,6 +28,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.staticfiles import StaticFiles
 
+from .. import __version__
 from ..core.errors import RunNotFound
 from ..core.models import Task
 from ..runtime import Runtime
@@ -80,7 +81,7 @@ def create_app(rt: Runtime, *, run_worker: bool = True) -> FastAPI:
                     await worker_task
 
     background: set[asyncio.Task] = set()
-    app = FastAPI(title="Autonomous AI Business Operations Agent", version="0.3.0", lifespan=lifespan)
+    app = FastAPI(title="Autonomous AI Business Operations Agent", version=__version__, lifespan=lifespan)
 
     def authenticate(request: Request, authorization: str | None = Header(default=None)) -> Principal:
         """Work out who is calling.

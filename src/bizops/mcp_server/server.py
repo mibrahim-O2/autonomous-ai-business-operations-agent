@@ -30,6 +30,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
+from .. import __version__
 from ..core.config import get_settings
 from ..core.errors import StaleLease, ToolError
 from ..integrations import Integrations, build_mock_integrations, seed_demo_data
@@ -52,7 +53,7 @@ def _annotations(risk: str) -> ToolAnnotations:
 
 
 def create_business_server(integrations: Integrations, db: Database, control: MockControl | None = None) -> MCPServer:
-    server = MCPServer("bizops-business", instructions=INSTRUCTIONS, version="0.2.0")
+    server = MCPServer("bizops-business", instructions=INSTRUCTIONS, version=__version__)
     crm, email, calendar, billing = integrations.crm, integrations.email, integrations.calendar, integrations.billing
 
     def guarded(

@@ -81,3 +81,19 @@ def test_context_builder_respects_budget(tmp_path):
     assert text.startswith("## objective")  # the most important section always survives
     roomy, roomy_stats = ContextBuilder(memory, token_budget=6000).build(state, step, {"query": "Harborline"})
     assert "## memory" in roomy and roomy_stats["memories"] == 5 and not roomy_stats["dropped"]
+
+
+def test_the_example_env_file_loads_as_shipped(tmp_path, monkeypatch):
+    """Copying .env.example to .env, as the setup guide says, must start cleanly with every secret unset."""
+    from pathlib import Path
+
+    from bizops.core.config import Settings
+
+    example = Path(__file__).resolve().parents[1] / ".env.example"
+    (tmp_path / ".env").write_text(example.read_text())
+    monkeypatch.chdir(tmp_path)
+    settings = Settings()
+    assert settings.llm_provider == "scripted" and settings.llm_price_input_per_mtok is None
+    assert settings.api_key is None and settings.webhook_secret is None and settings.webhook_secrets is None
+    assert settings.openai_api_key is None and settings.anthropic_api_key is None
+    assert settings.step_timeout_seconds == 120 and settings.approval_ttl_seconds == 86400

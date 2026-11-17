@@ -43,8 +43,17 @@ The defaults run the offline scripted model and store state in `var/bizops.db`. 
 | `BIZOPS_MAX_RUN_COST_USD` | `1.00` | Estimated cost ceiling per run |
 | `BIZOPS_CONTEXT_TOKEN_BUDGET` | `6000` | Token budget for an agent's context |
 | `BIZOPS_SEED_DEMO_DATA` | `true` | Load fictional records and policy documents at start-up |
-| `BIZOPS_API_KEY` | empty | Bearer key for run and job inspection endpoints; empty disables them |
-| `BIZOPS_WEBHOOK_SECRET` | empty | HMAC secret for webhook intake; empty disables webhooks |
+| `BIZOPS_STEP_TIMEOUT_SECONDS` | `120` | Time limit for one specialist working on one step |
+| `BIZOPS_TOOL_TIMEOUT_SECONDS` | `30` | Time limit for one tool call |
+| `BIZOPS_RETRY_BASE_SECONDS` | `0.5` | First delay before a retried step; doubles each retry, with jitter |
+| `BIZOPS_RETRY_MAX_SECONDS` | `8` | Longest delay between step retries |
+| `BIZOPS_APPROVAL_TTL_SECONDS` | `86400` | An unanswered approval request expires into a refusal after this time |
+| `BIZOPS_LLM_TIMEOUT_SECONDS` | `60` | Time limit for one request to a hosted model |
+| `BIZOPS_LLM_MAX_RETRIES` | `4` | Retries for rate limits and transient provider errors |
+| `BIZOPS_LLM_PRICE_INPUT_PER_MTOK`, `BIZOPS_LLM_PRICE_OUTPUT_PER_MTOK` | empty | Prices of the selected hosted model in USD per million tokens, for cost tracking |
+| `BIZOPS_API_KEY` | empty | Bootstrap administrator key for the default tenant. Prefer `bizops keys create`, which issues tenant- and role-bound keys |
+| `BIZOPS_WEBHOOK_SECRET` | empty | HMAC secret for webhooks to the default tenant; empty disables webhooks |
+| `BIZOPS_WEBHOOK_SECRETS` | empty | JSON binding further webhook sources to tenants: `{"shop": {"tenant": "acme", "secret": "..."}}` |
 | `BIZOPS_LOG_FORMAT` | `text` | `text` or `json` |
 
 ### Using a hosted model
@@ -55,7 +64,7 @@ Install the extra and set the key in `.env` (never in source):
 .venv/bin/pip install -e ".[anthropic]"
 ```
 
-Then set `BIZOPS_LLM_PROVIDER=anthropic` and `ANTHROPIC_API_KEY`. The hosted adapters have not been tested against live APIs in this repository; treat them as a starting point and run the test suite's scenarios against your provider before relying on them.
+Then set `BIZOPS_LLM_PROVIDER=anthropic` and `ANTHROPIC_API_KEY`. For OpenAI, install the `openai` extra and set `BIZOPS_LLM_PROVIDER=openai`, `BIZOPS_LLM_MODEL`, and `OPENAI_API_KEY`. Step-by-step checks with your own key are in [LIVE-MODELS.md](LIVE-MODELS.md).
 
 ## Run
 

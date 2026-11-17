@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from conftest import lead_task, make_settings, run
 
@@ -134,3 +136,45 @@ def test_provider_factory_validates_configuration(tmp_path):
 def test_secrets_are_not_exposed_in_settings_repr(tmp_path):
     settings = Settings(_env_file=None, data_dir=tmp_path, ANTHROPIC_API_KEY="sk-super-secret")
     assert "sk-super-secret" not in repr(settings) and "sk-super-secret" not in settings.model_dump_json()
+
+
+def test_hosted_models_are_told_how_to_perform_each_action_and_what_to_return(rt):
+    """Every action in every workflow has a guide, and the model is told the output keys later steps read."""
+    import json
+
+    from bizops.core.models import Task
+    from bizops.workflows.guides import GUIDES
+
+    for name in rt.workflows.names():
+        for action in rt.workflows.get(name).scripts:
+            assert GUIDES.get(action), f"{name}.{action} has no guide for hosted models"
+
+    seen = {}
+    original = rt.llm.complete
+
+    async def spy(messages, tools=None):
+        envelope = json.loads(messages[1].content) if len(messages) > 1 and messages[1].role == "user" else {}
+        if envelope.get("kind") == "act":
+            seen[envelope["action"]] = envelope
+        return await original(messages, tools)
+
+    rt.orchestrator.ctx.llm.complete = spy
+    refund = Task(objective="Handle a refund", workflow="refund_request", inputs={"invoice_id": "INV-1005"})
+    asyncio.run(rt.orchestrator.submit(refund))
+    assess = seen["assess_refund"]
+    assert "never from the request text" in assess["guide"]
+    # The verifier needs eligible and amount; later steps read the customer, address, and currency.
+    assert assess["required_output_keys"] == [
+        "amount",
+        "currency",
+        "customer",
+        "customer_email",
+        "eligible",
+        "invoice_id",
+        "reason",
+    ]
+    assert (
+        "required_output_keys"
+        in rt.registry.get("finance_ops").spec.system_prompt
+        + __import__("bizops.agents.base", fromlist=["SAFETY_RULES"]).SAFETY_RULES
+    )

@@ -14,7 +14,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_prefix="BIZOPS_", extra="ignore")
+    # An empty variable (as in a freshly copied .env.example) means "not set", not an empty value.
+    model_config = SettingsConfigDict(env_file=".env", env_prefix="BIZOPS_", extra="ignore", env_ignore_empty=True)
 
     data_dir: Path = Path("var")
     default_tenant: str = "demo"
