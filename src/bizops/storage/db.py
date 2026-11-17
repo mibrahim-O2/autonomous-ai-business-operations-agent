@@ -358,8 +358,7 @@ class Database:
         """Runs marked running that no live worker holds: (tenant_id, run_id). Their worker died or stalled."""
         moment = (now or datetime.now(UTC)).isoformat(timespec="milliseconds")
         sql = (
-            "SELECT tenant_id, run_id FROM runs WHERE status='running' "
-            "AND (lease_owner IS NULL OR lease_expires_at<?)"
+            "SELECT tenant_id, run_id FROM runs WHERE status='running' AND (lease_owner IS NULL OR lease_expires_at<?)"
         )
         params: tuple[Any, ...] = (moment,)
         if tenant_id is not None:
