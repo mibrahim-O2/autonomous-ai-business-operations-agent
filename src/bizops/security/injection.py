@@ -38,7 +38,11 @@ PATTERNS: dict[str, re.Pattern[str]] = {
         r"|\b(send|forward|wire|transfer|refund|export|delete)\b[^.\n]{0,40}\b(all|every|immediately|urgent)",
         re.I,
     ),
-    "secrecy": re.compile(r"\b(do not|don't|never)\b[^.\n]{0,25}\b(tell|mention|inform|alert|log)\b", re.I),
+    # Attempts to keep people out of the loop: "do not tell anyone", "without asking for approval".
+    "secrecy": re.compile(
+        r"\b(do not|don't|never|without)\b[^.\n]{0,25}\b(tell|mention|inform|alert|log|ask|notify|approv\w*)\b",
+        re.I,
+    ),
 }
 
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")

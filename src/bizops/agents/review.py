@@ -58,7 +58,9 @@ def build_report(state: RunState, verification: dict[str, Any]) -> dict[str, Any
         "run_id": state.run_id,
         "objective": state.task.objective,
         "workflow": state.analysis.get("workflow"),
-        "outcome": "verified" if verification["passed"] else "completed_with_issues",
+        "outcome": "verified"
+        if verification["passed"] and not state.working_memory.get("_unresolved_side_effects")
+        else "completed_with_issues",
         "plan_version": state.plan.version,
         "replans": state.replans,
         "steps": [
@@ -79,5 +81,8 @@ def build_report(state: RunState, verification: dict[str, Any]) -> dict[str, Any
         },
         "verification": verification,
         "tainted_by_untrusted_content": state.tainted,
+        "suspected_injection": [f["pattern"] for f in state.injection_findings],
+        # Side effects that may or may not have happened. Someone must check these by hand.
+        "unresolved_side_effects": state.working_memory.get("_unresolved_side_effects", []),
         "usage": state.usage.model_dump(),
     }

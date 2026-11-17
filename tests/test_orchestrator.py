@@ -146,7 +146,8 @@ def test_approval_gate_suspends_and_resume_does_not_repeat_side_effects(rt):
     waiting = run(rt.orchestrator.submit(lead_task()))
     assert waiting.status == RunStatus.WAITING_APPROVAL and waiting.pending_approval_id == "apr_x"
     qualify = waiting.plan.steps[2]
-    assert qualify.status == StepStatus.WAITING_APPROVAL and qualify.attempts == 1
+    # Waiting for a person does not use up one of the step's retry attempts.
+    assert qualify.status == StepStatus.WAITING_APPROVAL and qualify.attempts == 0
     contact = rt.db.kv_get("demo", "crm.contacts", EMAIL)
     assert contact["notes"] == []  # the upsert ran; the gated note did not
 

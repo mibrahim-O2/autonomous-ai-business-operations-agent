@@ -101,6 +101,8 @@ class Orchestrator:
         # Identity of this orchestrator instance in lease records.
         self.worker_id = new_id("worker")
         self.heartbeat_enabled = True
+        # Used for retry backoff only; replaceable in tests without touching the event loop's own sleep.
+        self.backoff_sleep = asyncio.sleep
         # Agents persist each tool record through the fenced checkpoint, and the gateway
         # verifies ownership immediately before every tool call.
         agent_ctx.checkpoint = self._checkpoint
@@ -343,6 +345,8 @@ class Orchestrator:
             try:
                 result = await self._execute_step(state, step)
             except ApprovalRequired as request:
+                # Waiting for a person is not a failed attempt; it must not use up the step's retries.
+                step.attempts = max(0, step.attempts - 1)
                 step.status = StepStatus.WAITING_APPROVAL
                 state.status = RunStatus.WAITING_APPROVAL
                 state.pending_approval_id = request.verdict.approval_id
@@ -371,7 +375,7 @@ class Orchestrator:
                     state, "step.retry_scheduled", step=step.action, attempt=step.attempts, delay_s=round(delay, 3)
                 )
                 if delay:
-                    await asyncio.sleep(delay)
+                    await self.backoff_sleep(delay)
                 continue
             if not await self._replan(state, step):
                 return self._fail(state, f"step '{step.action}' failed and no recovery plan exists: {step.error}")
@@ -410,9 +414,18 @@ class Orchestrator:
             span.update(ok=result.ok, summary=result.summary)
 
         step.finished_at = datetime.now(UTC)
-        if step.in_flight is not None:
-            # An interrupted call was never re-issued, so whether it landed is unknown. Say so in the
-            # trace instead of dropping the question silently.
+        will_retry = not result.ok and result.retryable and step.attempts < MAX_STEP_ATTEMPTS
+        if step.in_flight is not None and not will_retry:
+            # A side-effecting call whose outcome is unknown (interrupted or timed out) and that will not
+            # be re-sent. It may or may not have happened. Record it where a person will see it: the
+            # trace, and the final report. While a retry is coming the intent is kept, so the retry
+            # sends the same call under the same idempotency key and resolves the question.
+            unresolved = {
+                "tool": step.in_flight.tool,
+                "arguments": step.in_flight.arguments,
+                "step": step.action,
+            }
+            state.working_memory.setdefault("_unresolved_side_effects", []).append(unresolved)
             self.tracer.event(
                 state.tenant_id, state.run_id, "tool.intent_unresolved", tool=step.in_flight.tool, step_id=step.step_id
             )
