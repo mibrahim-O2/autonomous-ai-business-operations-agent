@@ -85,7 +85,7 @@ def test_gate_can_deny_or_require_approval(rt):
             ToolCall(tool="crm_upsert_contact", arguments={"email": "blocked@x.example"}),
         )
     )
-    assert not denied.ok and "denied by policy" in denied.error
+    assert not denied.ok and "denied" in denied.error
     with pytest.raises(ApprovalRequired) as caught:
         run(
             rt.gateway.execute(

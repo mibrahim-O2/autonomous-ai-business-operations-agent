@@ -2,6 +2,17 @@
 
 from .base import LLMMessage, LLMProvider, LLMResponse, ToolSchema, estimate_tokens
 from .factory import build_llm
+from .resilient import ResilientLLM, classify_provider_error
 from .scripted import ScriptedLLM
 
-__all__ = ["LLMMessage", "LLMProvider", "LLMResponse", "ScriptedLLM", "ToolSchema", "build_llm", "estimate_tokens"]
+__all__ = [
+    "LLMMessage",
+    "LLMProvider",
+    "LLMResponse",
+    "ResilientLLM",
+    "ScriptedLLM",
+    "classify_provider_error",
+    "ToolSchema",
+    "build_llm",
+    "estimate_tokens",
+]

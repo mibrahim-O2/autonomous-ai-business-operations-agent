@@ -26,6 +26,7 @@ so a signal cannot leave a tool half-applied.
 from __future__ import annotations
 
 import asyncio
+import random
 import sqlite3
 from datetime import UTC, datetime
 from typing import Any
@@ -105,6 +106,8 @@ class Orchestrator:
         agent_ctx.checkpoint = self._checkpoint
         agent_ctx.gateway.fence_guard = self._assert_current
         agent_ctx.gateway.checkpoint = self._checkpoint
+        # Set by the runtime when human approval is configured (ApprovalService).
+        self.approvals: Any = None
 
     # Public API --------------------------------------------------------------
     def create(self, task: Task) -> tuple[RunState, bool]:
@@ -158,7 +161,28 @@ class Orchestrator:
         state = self.db.load_run(tenant_id, run_id)
         if state.status in TERMINAL_RUN_STATES:
             return state
+        if (
+            state.status == RunStatus.WAITING_APPROVAL
+            and self.approvals is not None
+            and self.approvals.is_pending(tenant_id, state.pending_approval_id)
+        ):
+            # Nothing can proceed until a person decides; do not burn model calls re-running the step.
+            self.tracer.event(tenant_id, run_id, "run.resume_blocked", approval_id=state.pending_approval_id)
+            return state
         return await self._drive(tenant_id, run_id, resumed=True)
+
+    async def recover_interrupted(self) -> list[str]:
+        """Resume runs whose worker died or stalled (marked running, lease gone). Returns the run ids taken up.
+
+        Safe to call from every worker at any time: the claim decides who recovers a run, and a run
+        whose worker is merely slow still holds its lease and is not listed.
+        """
+        recovered = []
+        for tenant_id, run_id in self.db.list_interrupted_runs():
+            self.tracer.event(tenant_id, run_id, "run.recovery_started", worker=self.worker_id)
+            await self.resume(tenant_id, run_id)
+            recovered.append(run_id)
+        return recovered
 
     def request_pause(self, tenant_id: str, run_id: str) -> None:
         self.db.set_control(tenant_id, run_id, "pause")
@@ -177,8 +201,7 @@ class Orchestrator:
         state.generation = generation
         try:
             if state.status not in TERMINAL_RUN_STATES:
-                state.status = RunStatus.CANCELLED
-                self._checkpoint(state, "run.cancelled")
+                self._cancel(state)
         finally:
             self.db.release_lease(tenant_id, run_id, self.worker_id, generation)
         return state
@@ -198,6 +221,14 @@ class Orchestrator:
         self.db.save_run(state, fence=(self.worker_id, state.generation), lease_seconds=self.settings.run_lease_seconds)
         if event:
             self.tracer.event(state.tenant_id, state.run_id, event, status=state.status.value, **payload)
+
+    def _cancel(self, state: RunState) -> RunState:
+        state.status = RunStatus.CANCELLED
+        self._checkpoint(state, "run.cancelled")
+        if self.approvals is not None:
+            # Nobody should be asked to approve an action for a run that will never perform it.
+            self.approvals.cancel_for_run(state.tenant_id, state.run_id, "system")
+        return state
 
     def _fail(self, state: RunState, error: str) -> RunState:
         state.status, state.error = RunStatus.FAILED, error
@@ -296,9 +327,7 @@ class Orchestrator:
         while True:
             signal = self.db.get_control(state.tenant_id, state.run_id)
             if signal == "cancel":
-                state.status = RunStatus.CANCELLED
-                self._checkpoint(state, "run.cancelled")
-                return state
+                return self._cancel(state)
             if signal == "pause":
                 self.db.set_control(state.tenant_id, state.run_id, "")
                 state.status = RunStatus.PAUSED
@@ -331,8 +360,18 @@ class Orchestrator:
             if result.ok:
                 continue
             if result.retryable and step.attempts < MAX_STEP_ATTEMPTS:
+                # Exponential backoff with full jitter: transient faults usually clear, and retrying
+                # at once (or in step with other workers) makes an overloaded dependency worse.
+                ceiling = min(
+                    self.settings.retry_max_seconds, self.settings.retry_base_seconds * 2 ** (step.attempts - 1)
+                )
+                delay = random.uniform(ceiling / 2, ceiling) if ceiling > 0 else 0.0
                 step.status = StepStatus.PENDING
-                self._checkpoint(state, "step.retry_scheduled", step=step.action, attempt=step.attempts)
+                self._checkpoint(
+                    state, "step.retry_scheduled", step=step.action, attempt=step.attempts, delay_s=round(delay, 3)
+                )
+                if delay:
+                    await asyncio.sleep(delay)
                 continue
             if not await self._replan(state, step):
                 return self._fail(state, f"step '{step.action}' failed and no recovery plan exists: {step.error}")
@@ -353,7 +392,7 @@ class Orchestrator:
             if agent is None:
                 result = AgentResult(ok=False, summary=f"no agent named '{step.agent}'", error="unknown_agent")
             else:
-                result = await agent.run(step, state, inputs, self.ctx)
+                result = await self._run_agent(agent, step, state, inputs)
                 # One handoff is allowed per attempt: the first agent may pass the step to a better-suited one.
                 target = self.registry.get(result.handoff_to) if result.handoff_to else None
                 if target is not None and target is not agent and step.action in target.spec.actions:
@@ -367,7 +406,7 @@ class Orchestrator:
                         reason=result.handoff_reason,
                     )
                     step.agent = target.spec.name
-                    result = await target.run(step, state, inputs, self.ctx)
+                    result = await self._run_agent(target, step, state, inputs)
             span.update(ok=result.ok, summary=result.summary)
 
         step.finished_at = datetime.now(UTC)
@@ -390,6 +429,25 @@ class Orchestrator:
             state, "step.finished", step=step.action, ok=result.ok, summary=result.summary, error=step.error
         )
         return result
+
+    async def _run_agent(self, agent: Any, step: PlanStep, state: RunState, inputs: dict[str, Any]) -> AgentResult:
+        """Run one specialist on one step under the step time limit."""
+        try:
+            return await asyncio.wait_for(agent.run(step, state, inputs, self.ctx), self.settings.step_timeout_seconds)
+        except TimeoutError:
+            self.tracer.event(
+                state.tenant_id,
+                state.run_id,
+                "step.timed_out",
+                step=step.action,
+                limit_s=self.settings.step_timeout_seconds,
+            )
+            return AgentResult(
+                ok=False,
+                summary=f"step exceeded its {self.settings.step_timeout_seconds:g}s time limit",
+                error="step_timeout",
+                retryable=True,
+            )
 
     async def _replan(self, state: RunState, failed: PlanStep) -> bool:
         """Ask the planner for a way around a failed step. Returns False when the run cannot continue."""

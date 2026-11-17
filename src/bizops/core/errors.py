@@ -40,3 +40,19 @@ class StaleLease(BizOpsError):
 
     A worker that sees this must stop at once without writing anything further.
     """
+
+
+class AuthenticationError(BizOpsError):
+    """The caller did not present a valid credential."""
+
+
+class Conflict(BizOpsError):
+    """The request is valid but the object is not in a state that allows it (for example, already decided)."""
+
+
+class LLMError(BizOpsError):
+    """A model call failed. `retryable` says whether trying again may help; `retry_after` is a provider hint."""
+
+    def __init__(self, message: str, *, retryable: bool = False, retry_after: float | None = None):
+        super().__init__(message)
+        self.retryable, self.retry_after = retryable, retry_after

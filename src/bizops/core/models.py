@@ -31,6 +31,10 @@ class RiskLevel(StrEnum):
     MEDIUM = "medium"  # internal write that is awkward to undo
     HIGH = "high"  # external, financial, or irreversible
 
+    @property
+    def rank(self) -> int:
+        return ["read", "low", "medium", "high"].index(self.value)
+
 
 class RunStatus(StrEnum):
     PENDING = "pending"
@@ -173,6 +177,11 @@ class RunState(BaseModel):
     # Set once any untrusted content has entered the run; later tasks tighten policy on it.
     tainted: bool = False
     pending_approval_id: str | None = None
+    # Suspected prompt-injection attempts seen in untrusted content during this run.
+    injection_findings: list[dict[str, Any]] = Field(default_factory=list)
+    # Email addresses and links that entered the run only through untrusted content. A side-effecting
+    # call that uses one of them is pointed out to the approver.
+    untrusted_refs: list[str] = Field(default_factory=list)
     # Fencing token: the claim generation under which this copy of the state is being executed.
     # It increases every time a worker claims the run and is checked on every write.
     generation: int = 0

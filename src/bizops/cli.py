@@ -6,6 +6,14 @@ bizops status|resume|pause|cancel|trace RUN_ID
 bizops runs | agents | tools | mcp     inspect the system
 bizops kb ingest PATH | kb search "q"  manage and query the knowledge base
 bizops state [crm|sent|drafts|tasks|invoices]   show mock business data
+bizops approvals [--status pending]    list approval requests
+bizops approve ID [--all-in-step]      approve a request and continue its run
+bizops reject ID --comment "why"       reject a request and continue its run
+bizops policy [show|reset]             show or reset the approval policy
+bizops audit [--verify]                show the audit log or verify its hash chain
+bizops keys create NAME --role ROLE    create a tenant- and role-bound API key (shown once)
+bizops keys list | keys revoke ID
+bizops recover                         resume runs whose worker died
 bizops worker --once                   process queued jobs
 bizops serve                           start the HTTP API and worker
 """
@@ -14,15 +22,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import json
 import sys
 from pathlib import Path
 from typing import Any
 
+from .approvals import DEFAULT_POLICY, load_policy, save_policy
 from .core.errors import BizOpsError
 from .core.models import RunState, Task
 from .demo import SCENARIOS
 from .runtime import Runtime, build_runtime
+from .security import Principal, Role
 
 DEMOS = {s["key"]: (s["objective"], name, s["inputs"]) for name, s in SCENARIOS.items()}
 STATE_NAMESPACES = {
@@ -50,6 +61,25 @@ def _print_run(state: RunState) -> None:
     if state.final_report:
         verification = state.final_report["verification"]
         print(f"Outcome: {state.final_report['outcome']}  (verification passed: {verification['passed']})")
+
+
+def _operator(args: argparse.Namespace, tenant: str) -> Principal:
+    """The person running the command. Someone with shell access to the deployment is an administrator."""
+    name = getattr(args, "as_name", None) or f"cli:{getpass.getuser()}"
+    return Principal(name=name, tenant_id=tenant, role=Role.ADMIN, kind="local")
+
+
+def _print_approval(record: dict[str, Any]) -> None:
+    print(
+        f"{record['approval_id']}  {record['status']:<9} {record['tool']}  risk={record['risk']}  "
+        f"needs={record['required_role']}  run={record['run_id']}"
+    )
+    print(f"    arguments: {json.dumps(record['arguments'])}")
+    print(f"    why: {record['reason']} (rule {record['rule']})")
+    if record["signals"]:
+        print(f"    look twice: {', '.join(record['signals'])}")
+    if record["decided_by"]:
+        print(f"    decided by {record['decided_by']} at {record['decided_at']}: {record['comment'] or '(no comment)'}")
 
 
 def _parse_inputs(pairs: list[str]) -> dict[str, Any]:
@@ -80,6 +110,14 @@ async def _dispatch(args: argparse.Namespace, rt: Runtime) -> int:
             )
         state = await rt.orchestrator.submit(task)
         _print_run(state)
+        if state.status.value == "waiting_approval":
+            print("\nWaiting for a person. Nothing below has been executed yet:")
+            for record in rt.approvals.list(tenant, status="pending", run_id=state.run_id):
+                _print_approval(record)
+            print(
+                f"\nDecide with:  bizops approve {state.pending_approval_id}   or   bizops reject "
+                f'{state.pending_approval_id} --comment "reason"'
+            )
         if args.json and state.final_report:
             print(json.dumps(state.final_report, indent=2, default=str))
         return 0 if state.status.value in ("completed", "waiting_approval", "paused") else 1
@@ -126,6 +164,63 @@ async def _dispatch(args: argparse.Namespace, rt: Runtime) -> int:
                 print(f"{doc['doc_id']}  {doc['doc_type']:<10} trusted={doc['trusted']!s:<5} {doc['title']}")
     elif command == "state":
         print(json.dumps(rt.db.kv_list(tenant, STATE_NAMESPACES[args.what]), indent=2))
+    elif command == "approvals":
+        records = rt.approvals.list(tenant, status=args.status)
+        if not records:
+            print("No approval requests" + (f" with status {args.status}." if args.status else "."))
+        for record in records:
+            _print_approval(record)
+    elif command in ("approve", "reject"):
+        principal = _operator(args, tenant)
+        scope = "step_tool" if getattr(args, "all_in_step", False) else "call"
+        record = rt.approvals.decide(principal, args.approval_id, command == "approve", args.comment, scope)
+        print(f"Recorded: {record['status']} by {record['decided_by']}.")
+        state = await rt.orchestrator.resume(tenant, record["run_id"])
+        _print_run(state)
+        if state.status.value == "waiting_approval":
+            print(f"\nAnother request is waiting: {state.pending_approval_id}")
+    elif command == "policy":
+        if args.policy_command == "reset":
+            saved = save_policy(rt.db, tenant, DEFAULT_POLICY)
+            rt.audit.record(tenant, _operator(args, tenant).name, "policy.reset", "approval", actor_role="admin")
+            print(f"Approval policy reset to the default (version {saved.version}).")
+        else:
+            print(load_policy(rt.db, tenant).model_dump_json(indent=2))
+    elif command == "audit":
+        if args.verify:
+            result = rt.audit.verify(tenant)
+            print(json.dumps(result, indent=2))
+            return 0 if result["ok"] else 1
+        for entry in reversed(rt.audit.list(tenant, args.limit)):
+            detail = json.dumps(entry["detail"], default=str)[:110]
+            print(
+                f"{entry['seq']:>5}  {entry['at'][:19]}  {entry['actor']:<22} {entry['action']:<24} "
+                f"{entry['target']:<18} {detail}"
+            )
+    elif command == "keys":
+        if args.keys_command == "create":
+            key_id, token = rt.keys.create(tenant, args.name, Role(args.role), created_by=_operator(args, tenant).name)
+            rt.audit.record(
+                tenant, _operator(args, tenant).name, "key.created", key_id, actor_role="admin", role=args.role
+            )
+            print(f"Created key {key_id} for tenant '{tenant}' with role '{args.role}'.")
+            print("Store this token now; it cannot be shown again:")
+            print(token)
+        elif args.keys_command == "revoke":
+            if not rt.keys.revoke(tenant, args.key_id):
+                raise SystemExit("key not found or already revoked")
+            rt.audit.record(tenant, _operator(args, tenant).name, "key.revoked", args.key_id, actor_role="admin")
+            print(f"Revoked {args.key_id}.")
+        else:
+            for key in rt.keys.list(tenant):
+                state_text = "revoked" if key["revoked_at"] else "active"
+                print(
+                    f"{key['key_id']}  {key['role']:<9} {state_text:<8} {key['name']}  "
+                    f"last used {key['last_used_at'] or 'never'}"
+                )
+    elif command == "recover":
+        recovered = await rt.orchestrator.recover_interrupted()
+        print(f"Recovered {len(recovered)} interrupted run(s): {', '.join(recovered) or 'none'}")
     elif command == "worker":
         if args.once:
             for outcome in await rt.worker.drain():
@@ -175,6 +270,31 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--trusted-only", action="store_true")
     state = sub.add_parser("state", help="show mock business data")
     state.add_argument("what", choices=sorted(STATE_NAMESPACES))
+    listing = sub.add_parser("approvals", help="list approval requests")
+    listing.add_argument("--status", default=None, choices=["pending", "approved", "rejected", "expired", "cancelled"])
+    for name in ("approve", "reject"):
+        decision = sub.add_parser(name, help=f"{name} an approval request and continue its run")
+        decision.add_argument("approval_id")
+        decision.add_argument("--comment", default="", required=name == "reject")
+        decision.add_argument("--as", dest="as_name", default=None, help="name recorded as the decider")
+        if name == "approve":
+            decision.add_argument(
+                "--all-in-step", action="store_true", help="also approve further calls to this tool in the same step"
+            )
+    policy = sub.add_parser("policy", help="approval policy")
+    policy.add_argument("policy_command", nargs="?", default="show", choices=["show", "reset"])
+    audit = sub.add_parser("audit", help="audit log")
+    audit.add_argument("--verify", action="store_true", help="verify the hash chain")
+    audit.add_argument("--limit", type=int, default=40)
+    keys = sub.add_parser("keys", help="API keys")
+    keys_sub = keys.add_subparsers(dest="keys_command", required=True)
+    keys_sub.add_parser("list")
+    create = keys_sub.add_parser("create")
+    create.add_argument("name")
+    create.add_argument("--role", required=True, choices=[r.value for r in Role])
+    revoke = keys_sub.add_parser("revoke")
+    revoke.add_argument("key_id")
+    sub.add_parser("recover", help="resume runs whose worker died")
     worker = sub.add_parser("worker", help="process queued jobs")
     worker.add_argument("--once", action="store_true", help="drain due jobs and exit")
     serve = sub.add_parser("serve", help="start the HTTP API and worker")

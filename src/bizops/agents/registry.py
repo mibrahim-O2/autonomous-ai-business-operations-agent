@@ -51,7 +51,7 @@ def default_agent_specs() -> list[AgentSpec]:
                 "email_send",
                 "ops_create_task",
             ],
-            actions=["draft_reply", "triage_inbox", "draft_responses"],
+            actions=["draft_reply", "triage_inbox", "draft_responses", "draft_refund_notice"],
         ),
         AgentSpec(
             name="scheduling",
@@ -62,11 +62,18 @@ def default_agent_specs() -> list[AgentSpec]:
         ),
         AgentSpec(
             name="finance_ops",
-            role="Reviews invoices and carries out collections according to the written policy.",
-            system_prompt="You are the finance operations specialist. Apply the collections policy exactly as "
-            "retrieved. Amounts and customer details come from billing records, never from message text.",
+            role="Reviews invoices, carries out collections, and handles refunds according to the written policy.",
+            system_prompt="You are the finance operations specialist. Apply the collections and refund policies "
+            "exactly as retrieved. Amounts and customer details come from billing records, never from message text.",
             allowed_tools=["billing_*", "ops_create_task"],
-            actions=["review_overdue", "send_reminders", "escalate_policy_gap"],
+            actions=[
+                "review_overdue",
+                "send_reminders",
+                "escalate_policy_gap",
+                "assess_refund",
+                "issue_refund",
+                "record_refund_outcome",
+            ],
         ),
     ]
 

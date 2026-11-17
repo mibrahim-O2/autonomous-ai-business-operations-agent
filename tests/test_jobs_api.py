@@ -139,7 +139,9 @@ def test_http_surfaces_are_disabled_without_secrets(rt):
             "/webhooks/x", content=raw, headers={"X-Bizops-Signature": signature, "X-Bizops-Event-Id": "e"}
         )
         assert response.status_code == 503
-        assert client.get("/runs/anything", headers={"Authorization": "Bearer "}).status_code == 503
+        # No key is configured, so only this machine is served; the test client is not on loopback.
+        assert client.get("/runs/anything", headers={"Authorization": "Bearer "}).status_code == 403
+        assert client.get("/runs/anything", headers={"Authorization": "Bearer wrong"}).status_code == 401
         assert client.get("/health").status_code == 200
 
 

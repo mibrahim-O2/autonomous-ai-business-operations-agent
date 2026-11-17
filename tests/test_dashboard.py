@@ -5,7 +5,7 @@ import re
 import time
 from pathlib import Path
 
-from conftest import make_settings, run, started
+from conftest import make_settings, run, started, submit_approved
 from fastapi.testclient import TestClient
 
 from bizops.api import create_app
@@ -20,18 +20,20 @@ def _client(rt, client=LOCAL):
     return TestClient(create_app(rt, run_worker=False), client=client)
 
 
-def _wait_for(client, run_id, timeout=10.0):
+def _wait_for(client, run_id, timeout=10.0, until=None):
+    """Poll a run until it is terminal, or until it reaches the status named by `until`."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         detail = client.get(f"/api/runs/{run_id}").json()
-        if detail["terminal"]:
+        if detail["terminal"] or (until and detail["status"] == until and not detail["being_executed"]):
             return detail
         time.sleep(0.05)
     raise AssertionError("run did not finish in time")
 
 
 def test_overview_agents_and_workflows_reflect_real_state(rt):
-    run(rt.orchestrator.submit(Task(objective="Review overdue invoices", workflow="invoice_collections")))
+    # send_reminders runs twice: once until it reaches the approval, once after the decision.
+    submit_approved(rt, Task(objective="Review overdue invoices", workflow="invoice_collections"))
     with _client(rt) as client:
         meta = client.get("/api/meta").json()
         assert meta["mode"] == "live" and meta["llm"] == {
@@ -41,13 +43,15 @@ def test_overview_agents_and_workflows_reflect_real_state(rt):
         }
         overview = client.get("/api/overview").json()
         assert overview["totals"]["runs"] == 1 and overview["totals"]["success_rate"] == 1.0
-        assert overview["by_workflow"][0]["workflow"] == "invoice_collections" and overview["usage"]["model_calls"] == 9
+        assert (
+            overview["by_workflow"][0]["workflow"] == "invoice_collections" and overview["usage"]["model_calls"] == 10
+        )
         assert overview["activity"][0]["kind"] == "run.completed"
         agents = {a["name"]: a for a in client.get("/api/agents").json()}
         assert set(agents) == {"research", "sales_ops", "communications", "scheduling", "finance_ops"}
         finance_tools = {t["name"] for t in agents["finance_ops"]["tools"]}
         assert "billing_send_reminder" in finance_tools and "email_send" not in finance_tools
-        assert agents["finance_ops"]["steps_executed"] == 2 and agents["scheduling"]["steps_executed"] == 0
+        assert agents["finance_ops"]["steps_executed"] == 3 and agents["scheduling"]["steps_executed"] == 0
         workflows = {w["name"]: w for w in client.get("/api/workflows").json()}
         assert [s["action"] for s in workflows["invoice_collections"]["steps"]] == [
             "research_policy",
@@ -62,7 +66,7 @@ def test_starting_a_workflow_executes_a_real_run(rt):
         started_run = client.post("/api/workflows/inbox_triage/start", json={})
         assert started_run.status_code == 202
         detail = _wait_for(client, started_run.json()["run_id"])
-        assert detail["status"] == "completed" and detail["tainted"] and detail["requested_by"] == "dashboard"
+        assert detail["status"] == "completed" and detail["tainted"] and detail["requested_by"] == "local-operator"
         assert [s["action"] for s in detail["steps"]] == ["triage_inbox", "draft_responses"]
         read_calls = [t for t in detail["steps"][0]["tool_calls"] if t["tool"] == "email_read_message"]
         assert len(read_calls) == 3 and all(t["untrusted"] for t in read_calls)
@@ -87,8 +91,13 @@ def test_disabling_an_agent_blocks_plans_that_need_it(rt):
         assert blocked["status"] == "failed" and "disabled" in blocked["error"] and "finance_ops" in blocked["error"]
         assert rt.db.kv_list("demo", "email.sent") == {}
         client.post("/api/agents/finance_ops/enabled", json={"enabled": True})
-        allowed = _wait_for(client, client.post("/api/workflows/invoice_collections/start", json={}).json()["run_id"])
-        assert allowed["status"] == "completed"
+        allowed = _wait_for(
+            client,
+            client.post("/api/workflows/invoice_collections/start", json={}).json()["run_id"],
+            until="waiting_approval",
+        )
+        # With the agent enabled again the plan proceeds, as far as the reminder that needs a person.
+        assert allowed["status"] == "waiting_approval" and allowed["steps"][1]["status"] == "succeeded"
         assert client.post("/api/agents/ghost/enabled", json={"enabled": False}).status_code == 404
         assert client.post("/api/agents/research/enabled", json={"enabled": "maybe"}).status_code == 422
 

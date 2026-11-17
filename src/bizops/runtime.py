@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .agents import AgentContext, AgentRegistry, PlannerAgent
+from .approvals import ApprovalService, PolicyGate
 from .core.config import Settings, get_settings
 from .integrations import Integrations, build_mock_integrations, seed_demo_data
 from .integrations.mock import MockControl
@@ -25,6 +26,7 @@ from .mcp_server import create_business_server
 from .memory import ContextBuilder, MemoryStore
 from .observability import Tracer, configure_logging
 from .orchestrator import Orchestrator
+from .security import ApiKeyStore, AuditLog
 from .storage import Database
 from .tools import ApprovalGate, LocalToolExecutor, ToolExecutor, ToolGateway
 from .tools.mcp_executor import MCPToolExecutor
@@ -50,6 +52,9 @@ class Runtime:
     orchestrator: Orchestrator
     queue: JobQueue
     worker: Worker
+    audit: AuditLog
+    approvals: ApprovalService
+    keys: ApiKeyStore
     _started: bool = field(default=False, repr=False)
 
     async def start(self) -> Runtime:
@@ -97,7 +102,18 @@ def build_runtime(
 
     # The business systems are reached only through MCP, in-process by default.
     mcp = MCPToolExecutor("business", create_business_server(integrations, db, mock_control))
-    gateway = ToolGateway([LocalToolExecutor(memory, knowledge), mcp, *(extra_executors or [])], db, tracer, gate)
+    # Human-in-the-loop control is on by default: the tenant's approval policy decides which tool
+    # calls wait for a person. Passing `gate` replaces it (tests use this to isolate other behaviour).
+    audit = AuditLog(db)
+    approvals = ApprovalService(db, audit, settings.approval_ttl_seconds)
+    gateway = ToolGateway(
+        [LocalToolExecutor(memory, knowledge), mcp, *(extra_executors or [])],
+        db,
+        tracer,
+        gate or PolicyGate(db, approvals),
+        audit=audit,
+        tool_timeout_seconds=settings.tool_timeout_seconds,
+    )
     registry = AgentRegistry()
     planner = PlannerAgent(registry, workflows)
     agent_ctx = AgentContext(
@@ -117,6 +133,7 @@ def build_runtime(
         planner=planner,
         agent_ctx=agent_ctx,
     )
+    orchestrator.approvals = approvals
     queue = JobQueue(db)
     return Runtime(
         settings,
@@ -134,4 +151,7 @@ def build_runtime(
         orchestrator,
         queue,
         Worker(queue, orchestrator),
+        audit,
+        approvals,
+        ApiKeyStore(db),
     )

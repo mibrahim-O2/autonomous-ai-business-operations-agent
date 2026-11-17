@@ -16,6 +16,7 @@ approval are enforced below the model: a model cannot talk its way past them.
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import hashlib
 import json
@@ -31,6 +32,8 @@ from ..core.errors import BizOpsError, StaleLease, ToolError
 from ..core.models import PlanStep, RiskLevel, RunState, ToolCall, ToolResult
 from ..memory.store import bm25_scores
 from ..observability import Tracer
+from ..security.audit import AuditLog
+from ..security.injection import extract_refs, scan_for_injection
 from ..storage import Database
 from .base import ToolContext, ToolExecutor, ToolSpec
 
@@ -78,8 +81,16 @@ def fingerprint(tool: str, arguments: dict[str, Any]) -> str:
 
 
 class ToolGateway:
-    def __init__(self, executors: list[ToolExecutor], db: Database, tracer: Tracer, gate: ApprovalGate | None = None):
-        self.db, self.tracer = db, tracer
+    def __init__(
+        self,
+        executors: list[ToolExecutor],
+        db: Database,
+        tracer: Tracer,
+        gate: ApprovalGate | None = None,
+        audit: AuditLog | None = None,
+        tool_timeout_seconds: float = 30.0,
+    ):
+        self.db, self.tracer, self.audit, self.tool_timeout_seconds = db, tracer, audit, tool_timeout_seconds
         self.gate: ApprovalGate = gate or AllowAllGate()
         self._executors = list(executors)
         self._specs: dict[str, tuple[ToolSpec, ToolExecutor]] = {}
@@ -174,7 +185,19 @@ class ToolGateway:
 
         verdict = self.gate.evaluate(state, step, agent, spec, call.model_copy(update={"arguments": arguments}), fp)
         if verdict.decision == GateDecision.DENY:
-            return failed(f"denied by policy: {verdict.reason}", fp=fp)
+            if self.audit is not None:
+                self.audit.record(
+                    state.tenant_id,
+                    f"agent:{agent}",
+                    "tool.denied",
+                    call.tool,
+                    actor_role="agent",
+                    run_id=state.run_id,
+                    step=step.action,
+                    reason=verdict.reason,
+                    approval_id=verdict.approval_id,
+                )
+            return failed(f"denied: {verdict.reason}", fp=fp)
         if verdict.decision == GateDecision.REQUIRE_APPROVAL:
             raise ApprovalRequired(verdict, call.model_copy(update={"arguments": arguments}), spec.name, spec.risk)
 
@@ -205,8 +228,9 @@ class ToolGateway:
             risk=spec.risk.value,
             step_id=step.step_id,
         ) as span:
+            timed_out = False
             try:
-                output = await executor.call(call.tool, arguments, ctx)
+                output = await asyncio.wait_for(executor.call(call.tool, arguments, ctx), self.tool_timeout_seconds)
                 # A tool may flag an individual result as containing outside-authored text.
                 dynamic_untrusted = isinstance(output, dict) and bool(output.pop("_untrusted", False))
                 result = ToolResult(
@@ -219,6 +243,19 @@ class ToolGateway:
                 )
             except StaleLease:
                 raise  # not a tool failure: this worker must stop, so do not convert it to a result
+            except TimeoutError:
+                # The outcome is unknown: the call may or may not have landed. It is reported as a
+                # retryable failure and the write-ahead intent is kept, so the retry sends this same
+                # call under the same idempotency key.
+                timed_out = True
+                result = ToolResult(
+                    call_id=call.call_id,
+                    tool=call.tool,
+                    ok=False,
+                    error=f"timed out after {self.tool_timeout_seconds:g}s",
+                    retryable=True,
+                    fingerprint=fp,
+                )
             except ToolError as exc:
                 result = ToolResult(
                     call_id=call.call_id,
@@ -235,9 +272,46 @@ class ToolGateway:
             result.duration_ms = round((time.perf_counter() - started) * 1000, 2)
             span.update(ok=result.ok, error=result.error)
         if result.untrusted:
-            state.tainted = True
+            self._note_untrusted(state, step, call.tool, result.output)
+        if spec.side_effect and self.audit is not None:
+            # Every action on a business system is on the audit record, with who allowed it.
+            self.audit.record(
+                state.tenant_id,
+                f"agent:{agent}",
+                "tool.executed" if result.ok else "tool.failed",
+                call.tool,
+                actor_role="agent",
+                run_id=state.run_id,
+                step=step.action,
+                risk=spec.risk.value,
+                fingerprint=fp,
+                allowed_by=verdict.reason,
+                approval_id=verdict.approval_id,
+                error=result.error,
+            )
         step.tool_calls.append(result)
-        # The outcome is known now (a failed call is retried under the same key, so it is safe too).
-        # The caller checkpoints the record and the cleared intent together.
-        step.in_flight = None
+        if not timed_out:
+            # The outcome is known now (a failed call is retried under the same key, so it is safe too).
+            # The caller checkpoints the record and the cleared intent together.
+            step.in_flight = None
         return result
+
+    def _note_untrusted(self, state: RunState, step: PlanStep, tool: str, output: Any) -> None:
+        """Record that outside-authored text entered the run, and what it contained that matters later."""
+        state.tainted = True
+        trusted = extract_refs(state.task.inputs)
+        fresh = sorted((extract_refs(output) - trusted) - set(state.untrusted_refs))
+        state.untrusted_refs = (state.untrusted_refs + fresh)[:200]
+        findings = scan_for_injection(output)
+        if findings:
+            known = {(f["tool"], f["pattern"]) for f in state.injection_findings}
+            new = [{"tool": tool, "step": step.action, **f} for f in findings if (tool, f["pattern"]) not in known]
+            state.injection_findings = (state.injection_findings + new)[:50]
+            self.tracer.event(
+                state.tenant_id,
+                state.run_id,
+                "security.injection_suspected",
+                tool=tool,
+                step=step.action,
+                patterns=[f["pattern"] for f in findings],
+            )

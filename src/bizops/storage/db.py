@@ -137,6 +137,61 @@ MIGRATIONS: list[str] = [
         PRIMARY KEY (tenant_id, scope)
     );
     """,
+    # 4: human approvals, tenant- and role-bound API keys, tamper-evident audit log
+    """
+    CREATE TABLE approvals (
+        approval_id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        step_id TEXT NOT NULL,
+        step_action TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        tool TEXT NOT NULL,
+        arguments_json TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        risk TEXT NOT NULL,
+        rule TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        signals_json TEXT NOT NULL DEFAULT '[]',
+        required_role TEXT NOT NULL,
+        status TEXT NOT NULL,
+        scope TEXT NOT NULL DEFAULT 'call',
+        requested_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        decided_at TEXT,
+        decided_by TEXT,
+        decided_role TEXT,
+        comment TEXT
+    );
+    CREATE INDEX idx_approvals_tenant ON approvals(tenant_id, status, requested_at);
+    CREATE INDEX idx_approvals_run ON approvals(tenant_id, run_id, step_id);
+
+    CREATE TABLE api_keys (
+        key_id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        role TEXT NOT NULL,
+        secret_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        last_used_at TEXT,
+        revoked_at TEXT
+    );
+
+    CREATE TABLE audit_log (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        tenant_id TEXT NOT NULL,
+        at TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        actor_role TEXT NOT NULL,
+        action TEXT NOT NULL,
+        target TEXT NOT NULL,
+        detail_json TEXT NOT NULL,
+        prev_hash TEXT NOT NULL,
+        hash TEXT NOT NULL
+    );
+    CREATE INDEX idx_audit_tenant ON audit_log(tenant_id, seq);
+    """,
 ]
 
 
@@ -298,6 +353,16 @@ class Database:
         if not rows:
             raise RunNotFound(f"run {run_id} not found for tenant {tenant_id}")
         return dict(rows[0])
+
+    def list_interrupted_runs(self, now: datetime | None = None) -> list[tuple[str, str]]:
+        """Runs marked running that no live worker holds: (tenant_id, run_id). Their worker died or stalled."""
+        moment = (now or datetime.now(UTC)).isoformat(timespec="milliseconds")
+        rows = self.query(
+            "SELECT tenant_id, run_id FROM runs WHERE status='running' "
+            "AND (lease_owner IS NULL OR lease_expires_at<?) ORDER BY updated_at",
+            (moment,),
+        )
+        return [(row["tenant_id"], row["run_id"]) for row in rows]
 
     def run_once(
         self, tenant_id: str, key: str, operation: str, action: Any, *, fence_scope: str = "", fence_token: int = 0

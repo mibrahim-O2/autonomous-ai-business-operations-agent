@@ -29,6 +29,14 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         "summary": "The research agent retrieves the collections policy; the finance agent applies it to each "
         "overdue invoice and sends the reminders the policy allows.",
     },
+    "refund_request": {
+        "key": "refund",
+        "title": "Refund request with human approval",
+        "objective": "Handle a refund request for a paid invoice",
+        "inputs": {"invoice_id": "INV-1005", "amount": 320, "reason": "Service cancelled before it started"},
+        "summary": "The finance agent checks the request against the invoice record and the refund policy, then "
+        "stops and waits for a person to approve the refund. Rejecting it hands the case to the finance team.",
+    },
     "inbox_triage": {
         "key": "inbox",
         "title": "Inbox triage with untrusted content",

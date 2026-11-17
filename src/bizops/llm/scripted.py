@@ -56,7 +56,11 @@ class ScriptedLLM:
         for message in messages:
             if message.role == "tool":
                 try:
-                    results.append({"tool": message.name, "result": json.loads(message.content)})
+                    result = json.loads(message.content)
+                    # Untrusted output arrives in a labelled envelope; the playbooks work on its content.
+                    if isinstance(result, dict) and set(result) == {"untrusted_content", "handling"}:
+                        result = result["untrusted_content"]
+                    results.append({"tool": message.name, "result": result})
                 except json.JSONDecodeError:
                     results.append({"tool": message.name, "result": message.content})
         key = f"{envelope.get('kind')}:{envelope.get('action')}"

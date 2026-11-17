@@ -9,8 +9,10 @@ A webhook is authenticated by its signature, mapped to a task, queued, and
 acknowledged with 202. Execution happens in the worker, so the sender gets a
 fast response and a retry of the same event id does not start a second run.
 
-Run inspection endpoints require the API key from BIZOPS_API_KEY as a bearer
-token. If no key is configured they are disabled, not open.
+Every other endpoint is authenticated. A bearer key identifies a principal with
+one tenant and one role (see security/auth.py); the tenant used for a request
+always comes from the key. With no key configured at all, the API serves only
+requests from the same machine.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from ..core.errors import RunNotFound
 from ..core.models import Task
 from ..runtime import Runtime
+from ..security import LOCAL_OPERATOR, Permission, Principal, Role
 from .dashboard import build_dashboard_router
 
 DASHBOARD_DIR = Path(__file__).resolve().parents[3] / "dashboard"
@@ -63,6 +66,10 @@ def create_app(rt: Runtime, *, run_worker: bool = True) -> FastAPI:
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI):
         await rt.start()
+        # Pick up runs that were in flight when a previous process stopped.
+        recovery = asyncio.create_task(rt.orchestrator.recover_interrupted())
+        background.add(recovery)
+        recovery.add_done_callback(background.discard)
         worker_task = asyncio.create_task(rt.worker.run_forever()) if run_worker else None
         try:
             yield
@@ -72,25 +79,33 @@ def create_app(rt: Runtime, *, run_worker: bool = True) -> FastAPI:
                 with contextlib.suppress(asyncio.CancelledError):
                     await worker_task
 
-    app = FastAPI(title="Autonomous AI Business Operations Agent", version="0.2.0", lifespan=lifespan)
     background: set[asyncio.Task] = set()
+    app = FastAPI(title="Autonomous AI Business Operations Agent", version="0.3.0", lifespan=lifespan)
 
-    def dashboard_access(request: Request, authorization: str | None = Header(default=None)) -> None:
-        """Who may use the dashboard API.
+    def authenticate(request: Request, authorization: str | None = Header(default=None)) -> Principal:
+        """Work out who is calling.
 
-        With BIZOPS_API_KEY set, a bearer key is required. Without it, only requests
-        from this machine (loopback) are served: convenient for local use, closed to
-        the network. A deployment reachable by others must set a key.
+        1. A bearer token is always checked first. `bzk_...` tokens are looked up in the key
+           store and yield the tenant and role bound to that key. The BIZOPS_API_KEY value is a
+           bootstrap administrator for the default tenant.
+        2. With no token, and only while no key of any kind has been configured, requests from
+           this machine are served as the local operator. This keeps single-user local use
+           simple and stays closed to the network. Configuring any key switches it off.
         """
+        token = (authorization or "").removeprefix("Bearer ").strip()
         configured = rt.settings.api_key.get_secret_value() if rt.settings.api_key else ""
-        if configured:
-            supplied = (authorization or "").removeprefix("Bearer ").strip()
-            if not hmac.compare_digest(configured.encode(), supplied.encode()):
-                raise HTTPException(401, "invalid or missing API key")
-            return
+        if token:
+            principal = rt.keys.authenticate(token)
+            if principal is None and configured and hmac.compare_digest(configured.encode(), token.encode()):
+                principal = Principal("bootstrap-admin", rt.settings.default_tenant, Role.ADMIN, kind="bootstrap")
+            if principal is None:
+                raise HTTPException(401, "invalid API key")
+            return principal
+        if configured or rt.keys.any_active():
+            raise HTTPException(401, "an API key is required")
         host = request.client.host if request.client else ""
         if host not in LOOPBACK_HOSTS:
-            raise HTTPException(403, "dashboard access from other machines requires BIZOPS_API_KEY")
+            raise HTTPException(403, "access from other machines requires an API key")
         # Loopback-only access is still reachable by a web page open in the same browser. Two checks
         # close that door: the Host header must name this machine (defeats DNS rebinding), and a
         # state-changing request must come from the dashboard's own origin (defeats cross-site requests).
@@ -100,8 +115,29 @@ def create_app(rt: Runtime, *, run_worker: bool = True) -> FastAPI:
         origin = request.headers.get("origin")
         if request.method not in ("GET", "HEAD", "OPTIONS") and origin and origin.split("://", 1)[-1] != served_host:
             raise HTTPException(403, "cross-origin requests are not accepted")
+        return LOCAL_OPERATOR(rt.settings.default_tenant)
 
-    app.include_router(build_dashboard_router(rt, dashboard_access, background))
+    current_principal = Depends(authenticate)
+
+    def require(permission: Permission) -> Any:
+        """Dependency factory: authenticate, then insist on one permission."""
+
+        def check(principal: Principal = current_principal) -> Principal:
+            if not principal.can(permission):
+                rt.audit.record(
+                    principal.tenant_id,
+                    principal.name,
+                    "access.denied",
+                    permission.value,
+                    actor_role=principal.role.value,
+                )
+                raise HTTPException(403, f"the '{principal.role.value}' role does not include '{permission.value}'")
+            return principal
+
+        return check
+
+    can_read = Depends(require(Permission.READ))
+    app.include_router(build_dashboard_router(rt, require, background))
 
     @app.get("/config.js", include_in_schema=False)
     async def dashboard_config() -> Response:
@@ -109,13 +145,19 @@ def create_app(rt: Runtime, *, run_worker: bool = True) -> FastAPI:
         body = "window.BIZOPS_CONFIG = " + json.dumps({"mode": "live", "apiBase": "/api"}) + ";\n"
         return Response(body, media_type="application/javascript", headers={"Cache-Control": "no-store"})
 
-    def require_api_key(authorization: str | None = Header(default=None)) -> None:
-        configured = rt.settings.api_key.get_secret_value() if rt.settings.api_key else ""
-        if not configured:
-            raise HTTPException(503, "API access is disabled: set BIZOPS_API_KEY")
-        supplied = (authorization or "").removeprefix("Bearer ").strip()
-        if not hmac.compare_digest(configured.encode(), supplied.encode()):
-            raise HTTPException(401, "invalid or missing API key")
+    def webhook_binding(source: str) -> tuple[str, str] | None:
+        """(secret, tenant) for a webhook source. A sender is bound to one tenant by its secret."""
+        if rt.settings.webhook_secrets:
+            try:
+                table = json.loads(rt.settings.webhook_secrets.get_secret_value())
+                entry = table.get(source) if isinstance(table, dict) else None
+            except json.JSONDecodeError:
+                entry = None
+            if isinstance(entry, dict) and entry.get("secret") and entry.get("tenant"):
+                return str(entry["secret"]), str(entry["tenant"])
+        if rt.settings.webhook_secret:
+            return rt.settings.webhook_secret.get_secret_value(), rt.settings.default_tenant
+        return None
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -129,9 +171,10 @@ def create_app(rt: Runtime, *, run_worker: bool = True) -> FastAPI:
         x_bizops_event_id: str | None = Header(default=None),
     ) -> dict[str, Any]:
         body = await request.body()
-        secret = rt.settings.webhook_secret.get_secret_value() if rt.settings.webhook_secret else ""
-        if not secret:
+        binding = webhook_binding(source)
+        if binding is None:
             raise HTTPException(503, "webhooks are disabled: set BIZOPS_WEBHOOK_SECRET")
+        secret, tenant = binding
         if not verify_signature(secret, body, x_bizops_signature):
             raise HTTPException(401, "invalid signature")
         if not x_bizops_event_id:
@@ -144,7 +187,12 @@ def create_app(rt: Runtime, *, run_worker: bool = True) -> FastAPI:
         if route is None:
             raise HTTPException(422, f"unsupported event '{payload.get('event')}'")
         data = payload.get("data") or {}
-        tenant = str(payload.get("tenant_id") or rt.settings.default_tenant)
+        # The tenant comes from the secret that signed the request, never from the body. A body that
+        # names a different tenant is refused instead of being silently redirected.
+        claimed = payload.get("tenant_id")
+        if claimed and str(claimed) != tenant:
+            rt.audit.record(tenant, f"webhook:{source}", "access.denied", "tenant", claimed_tenant=str(claimed))
+            raise HTTPException(403, "this webhook sender is not permitted to act for that tenant")
         dedupe = f"webhook:{source}:{x_bizops_event_id}"
         task = Task(
             tenant_id=tenant,
@@ -166,17 +214,17 @@ def create_app(rt: Runtime, *, run_worker: bool = True) -> FastAPI:
         )
         return {"job_id": job_id, "status": "queued" if created else "duplicate"}
 
-    @app.get("/jobs/{job_id}", dependencies=[Depends(require_api_key)])
-    async def get_job(job_id: str) -> dict[str, Any]:
+    @app.get("/jobs/{job_id}")
+    async def get_job(job_id: str, principal: Principal = can_read) -> dict[str, Any]:
         job = rt.queue.get(job_id)
-        if job is None:
+        if job is None or job["tenant_id"] != principal.tenant_id:
             raise HTTPException(404, "job not found")
         return {k: job[k] for k in ("job_id", "tenant_id", "status", "attempts", "result")}
 
-    @app.get("/runs/{run_id}", dependencies=[Depends(require_api_key)])
-    async def get_run(run_id: str, tenant_id: str | None = None) -> dict[str, Any]:
+    @app.get("/runs/{run_id}")
+    async def get_run(run_id: str, principal: Principal = can_read) -> dict[str, Any]:
         try:
-            state = rt.db.load_run(tenant_id or rt.settings.default_tenant, run_id)
+            state = rt.db.load_run(principal.tenant_id, run_id)
         except RunNotFound as exc:
             raise HTTPException(404, str(exc)) from exc
         return {
@@ -186,9 +234,9 @@ def create_app(rt: Runtime, *, run_worker: bool = True) -> FastAPI:
             "report": state.final_report,
         }
 
-    @app.get("/runs/{run_id}/trace", dependencies=[Depends(require_api_key)])
-    async def get_trace(run_id: str, tenant_id: str | None = None) -> list[dict[str, Any]]:
-        return rt.tracer.timeline(tenant_id or rt.settings.default_tenant, run_id)
+    @app.get("/runs/{run_id}/trace")
+    async def get_trace(run_id: str, principal: Principal = can_read) -> list[dict[str, Any]]:
+        return rt.tracer.timeline(principal.tenant_id, run_id)
 
     if DASHBOARD_DIR.exists():
         # Mounted last so that API routes take precedence over static files.

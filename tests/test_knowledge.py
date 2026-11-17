@@ -1,6 +1,6 @@
 """Ingestion, hybrid retrieval, and agentic retrieval behaviour."""
 
-from conftest import make_settings, run, started
+from conftest import make_settings, run, started, submit_approved
 
 from bizops.core.models import RunStatus, Task
 from bizops.knowledge import HashingEmbedder, KnowledgeBase, chunk_markdown, parse_front_matter
@@ -92,7 +92,7 @@ def test_kb_search_tool_taints_the_run_only_for_outside_material(rt):
 
 
 def test_collections_applies_the_retrieved_policy(rt):
-    state = run(rt.orchestrator.submit(COLLECTIONS))
+    state = submit_approved(rt, COLLECTIONS)
     assert state.status == RunStatus.COMPLETED and state.final_report["outcome"] == "verified"
     policy = state.final_report["results"]["research_policy"]
     assert policy["grounded"] and policy["facts"] == {
