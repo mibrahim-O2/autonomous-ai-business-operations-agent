@@ -231,3 +231,12 @@ def test_worker_loop_runs_the_sweep(rt):
 
     run(briefly())
     assert len(calls) >= 2
+
+
+def test_an_evaluation_interrupted_by_a_restart_does_not_block_new_ones(rt):
+    store = EvaluationStore(rt.db)
+    stuck = store.start("demo", "scripted", "scripted-v1", "tester")  # the process died during this run
+    with TestClient(create_app(rt, run_worker=False), client=("127.0.0.1", 1)) as c:  # start-up marks it
+        report = c.get(f"/api/evaluations/{stuck}").json()
+        assert report["status"] == "error" and "interrupted" in report["summary"]["error"]
+        assert c.post("/api/evaluations/run", json={"cases": ["lead-cold"]}).status_code == 202

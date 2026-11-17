@@ -31,6 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from .. import __version__
 from ..core.errors import RunNotFound
 from ..core.models import Task
+from ..evaluation import EvaluationStore
 from ..runtime import Runtime
 from ..security import LOCAL_OPERATOR, Permission, Principal, Role
 from .dashboard import build_dashboard_router
@@ -67,6 +68,8 @@ def create_app(rt: Runtime, *, run_worker: bool = True) -> FastAPI:
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI):
         await rt.start()
+        # An evaluation cannot survive a restart: record any left running as interrupted.
+        EvaluationStore(rt.db).mark_interrupted()
         # Pick up runs that were in flight when a previous process stopped.
         recovery = asyncio.create_task(rt.orchestrator.recover_interrupted())
         background.add(recovery)

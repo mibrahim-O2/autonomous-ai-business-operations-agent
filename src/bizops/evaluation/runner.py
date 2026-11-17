@@ -214,6 +214,16 @@ class EvaluationStore:
             ),
         )
 
+    def mark_interrupted(self) -> int:
+        """At start-up: evaluations left 'running' by a stopped process can never finish. Record them as
+        interrupted so they do not block new runs (only one may run at a time)."""
+        return self.db.execute(
+            "UPDATE evaluations SET status='error', finished_at=?, "
+            'summary_json=\'{"error": "interrupted: the server stopped before the evaluation finished"}\' '
+            "WHERE status='running'",
+            (datetime.now(UTC).isoformat(),),
+        ).rowcount
+
     def fail(self, eval_id: str, error: str) -> None:
         self.db.execute(
             "UPDATE evaluations SET status='error', finished_at=?, summary_json=? WHERE eval_id=?",
