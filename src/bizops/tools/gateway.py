@@ -183,6 +183,10 @@ class ToolGateway:
                 )
                 arguments, fp = intent.arguments, pinned_fp
 
+        # A superseded worker stops before it can do anything with side effects, including filing an
+        # approval request that a person would then be asked to decide.
+        if self.fence_guard is not None:
+            self.fence_guard(state)
         verdict = self.gate.evaluate(state, step, agent, spec, call.model_copy(update={"arguments": arguments}), fp)
         if verdict.decision == GateDecision.DENY:
             if self.audit is not None:

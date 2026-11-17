@@ -14,7 +14,7 @@ import pytest
 from conftest import lead_task, make_settings, run
 
 from bizops.core.errors import StaleLease
-from bizops.core.models import RunState, RunStatus, StepStatus
+from bizops.core.models import RunState, RunStatus, StepStatus, Task
 from bizops.runtime import build_runtime
 from bizops.storage import Database
 
@@ -423,3 +423,48 @@ def test_job_result_from_a_superseded_attempt_is_discarded(tmp_path):
     assert rt.queue.finish(job_id, "done", {"by": "first, late"}, attempt=1) is False
     assert rt.queue.get(job_id)["result"] == {"by": "second"}
     rt.close()
+
+
+def test_superseded_worker_files_no_approval_request(tmp_path):
+    """A worker that lost its run must not file approval requests a person would then be asked to decide.
+
+    The stale worker wakes with a refund call worded differently from anything its successor will send
+    (a live model may do this), so the request it would file is not one the successor would reuse.
+    """
+    a, b = two_workers(tmp_path)
+
+    async def scenario():
+        await a.start()
+        await b.start()
+        a.orchestrator.heartbeat_enabled = False
+        stalled, release = asyncio.Event(), asyncio.Event()
+        inner = a.llm
+
+        class StallBeforeRefund:
+            name, model = "stall", "stall-1"
+
+            async def complete(self, messages, tools=None):
+                response = await inner.complete(messages, tools)
+                for call in response.tool_calls:
+                    if call.tool == "billing_issue_refund" and not stalled.is_set():
+                        stalled.set()
+                        await release.wait()
+                        call.arguments["amount"] = 300.0  # differs from what the successor will ask for
+                return response
+
+        a.orchestrator.ctx.llm = StallBeforeRefund()
+        refund = Task(objective="Handle a refund request", workflow="refund_request", inputs={"invoice_id": "INV-1005"})
+        task_a = asyncio.create_task(a.orchestrator.submit(refund))
+        await asyncio.wait_for(stalled.wait(), 5)
+        run_id = a.db.list_runs("demo")[0]["run_id"]
+        expire_lease(a.db, run_id)
+        assert b.db.claim_run("demo", run_id, "successor", 60) == 2  # taken over, not yet at the refund step
+        release.set()
+        await asyncio.wait_for(task_a, 5)
+        return run_id
+
+    run_id = run(scenario())
+    assert b.approvals.list("demo", run_id=run_id) == []  # nobody is asked about the stale worker's call
+    assert "run.stale_worker_stopped" in events(b, run_id)
+    a.close()
+    b.close()

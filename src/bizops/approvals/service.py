@@ -271,7 +271,10 @@ class PolicyGate:
             (
                 r
                 for r in rows
-                if r["status"] == APPROVED and r["scope"] == "step_tool" and Role(r["decided_role"]).at_least(role)
+                if r["status"] == APPROVED
+                and r["scope"] == "step_tool"
+                and r["rule"] == rule  # a call caught by a different (for example stricter) rule needs its own decision
+                and Role(r["decided_role"]).at_least(role)
             ),
             None,
         )

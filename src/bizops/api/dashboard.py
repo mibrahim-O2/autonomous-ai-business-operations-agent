@@ -838,7 +838,7 @@ def build_dashboard_router(rt: Runtime, require: Any, background: set[asyncio.Ta
                     rt.db.list_events_by_kind(principal.tenant_id, "run.stale_worker_stopped", 500)
                 ),
                 "runs_recovered": len(rt.db.list_events_by_kind(principal.tenant_id, "run.recovery_started", 500)),
-                "interrupted_runs_now": len(rt.db.list_interrupted_runs()),
+                "interrupted_runs_now": len(rt.db.list_interrupted_runs(tenant_id=principal.tenant_id)),
                 "model_retry_stats": getattr(rt.llm, "stats", None),
             },
         }

@@ -74,8 +74,10 @@ class AuditLog:
     ) -> list[dict[str, Any]]:
         sql, params = "SELECT * FROM audit_log WHERE tenant_id=?", [tenant_id]
         if action_prefix:
-            sql += " AND action LIKE ?"
-            params.append(action_prefix.replace("%", "") + "%")
+            # Escape LIKE wildcards: action names contain underscores, which LIKE treats as "any character".
+            escaped = action_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            sql += " AND action LIKE ? ESCAPE '\\'"
+            params.append(escaped + "%")
         if target:
             sql += " AND target=?"
             params.append(target)

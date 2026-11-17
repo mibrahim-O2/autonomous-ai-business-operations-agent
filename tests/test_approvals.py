@@ -213,3 +213,25 @@ def test_read_only_tools_never_ask(rt):
     save_policy(rt.db, "demo", ApprovalPolicy(rules=[], default_decision="require_approval"))
     state = run(rt.orchestrator.submit(Task(objective="What is our refund policy?")))
     assert state.status == RunStatus.COMPLETED and rt.approvals.list("demo") == []
+
+
+def test_step_wide_approval_does_not_cover_a_call_caught_by_a_stricter_rule(rt):
+    from bizops.core.models import PlanStep, RunState, ToolCall
+    from bizops.tools.gateway import GateDecision, fingerprint
+
+    state = RunState(tenant_id="demo", task=REFUND)
+    rt.db.save_run(state)
+    step = PlanStep(agent="finance_ops", action="issue_refund", description="batch of refunds")
+    spec, gate = rt.gateway.spec("billing_issue_refund"), rt.gateway.gate
+
+    def ask(amount):
+        call = ToolCall(tool=spec.name, arguments={"invoice_id": "INV-1005", "amount": amount, "reason": "r"})
+        return gate.evaluate(state, step, "finance_ops", spec, call, fingerprint(call.tool, call.arguments))
+
+    small = ask(100)
+    assert rt.approvals.get("demo", small.approval_id)["rule"] == "high-risk-needs-approval"
+    rt.approvals.decide(approver(rt, "admin"), small.approval_id, True, scope="step_tool")
+    assert ask(150).decision == GateDecision.ALLOW  # same rule: covered by the batch approval
+    large = ask(900)  # caught by the admin-only rule: needs its own decision even though an admin approved the batch
+    assert large.decision == GateDecision.REQUIRE_APPROVAL
+    assert rt.approvals.get("demo", large.approval_id)["rule"] == "large-refund-needs-admin"

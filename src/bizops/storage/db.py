@@ -354,14 +354,17 @@ class Database:
             raise RunNotFound(f"run {run_id} not found for tenant {tenant_id}")
         return dict(rows[0])
 
-    def list_interrupted_runs(self, now: datetime | None = None) -> list[tuple[str, str]]:
+    def list_interrupted_runs(self, now: datetime | None = None, tenant_id: str | None = None) -> list[tuple[str, str]]:
         """Runs marked running that no live worker holds: (tenant_id, run_id). Their worker died or stalled."""
         moment = (now or datetime.now(UTC)).isoformat(timespec="milliseconds")
-        rows = self.query(
+        sql = (
             "SELECT tenant_id, run_id FROM runs WHERE status='running' "
-            "AND (lease_owner IS NULL OR lease_expires_at<?) ORDER BY updated_at",
-            (moment,),
+            "AND (lease_owner IS NULL OR lease_expires_at<?)"
         )
+        params: tuple[Any, ...] = (moment,)
+        if tenant_id is not None:
+            sql, params = sql + " AND tenant_id=?", (moment, tenant_id)
+        rows = self.query(sql + " ORDER BY updated_at", params)
         return [(row["tenant_id"], row["run_id"]) for row in rows]
 
     def run_once(

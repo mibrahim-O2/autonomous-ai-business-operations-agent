@@ -258,3 +258,23 @@ def test_tainted_run_tightens_policy_for_medium_risk(rt):
     assert (
         rt.gateway.gate.evaluate(tainted, step, "scheduling", spec, call, fp).decision == GateDecision.REQUIRE_APPROVAL
     )
+
+
+def test_audit_filter_treats_underscores_literally(rt):
+    rt.audit.record("demo", "t", "tool.executed", "x")
+    rt.audit.record("demo", "t", "toolXexecuted", "y")
+    assert [e["target"] for e in rt.audit.list("demo", action_prefix="tool.exec")] == ["x"]
+    rt.audit.record("demo", "t", "key_created", "k")
+    rt.audit.record("demo", "t", "keyXcreated", "z")
+    assert [e["target"] for e in rt.audit.list("demo", action_prefix="key_")] == ["k"]
+
+
+def test_security_posture_counts_only_the_callers_tenant(tmp_path):
+    rt = started(make_settings(tmp_path))
+    state = RunState(tenant_id="acme", task=REFUND.model_copy(update={"tenant_id": "acme"}), status=RunStatus.RUNNING)
+    rt.db.save_run(state)
+    assert rt.db.list_interrupted_runs() == [("acme", state.run_id)]
+    _, demo_token = rt.keys.create("demo", "viewer", Role.VIEWER)
+    with client(rt) as c:
+        assert c.get("/api/security", headers=bearer(demo_token)).json()["reliability"]["interrupted_runs_now"] == 0
+    rt.close()
